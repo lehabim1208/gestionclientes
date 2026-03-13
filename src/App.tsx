@@ -28,19 +28,52 @@ import {
   Moon,
   Sun,
   Monitor,
-  Download
+  Download,
+  Menu,
+  Trophy,
+  Search,
+  Edit2,
+  RefreshCw
 } from 'lucide-react';
 import { motion, AnimatePresence, LayoutGroup } from 'motion/react';
 import Cookies from 'js-cookie';
 import CryptoJS from 'crypto-js';
 import { supabase } from './lib/supabase';
-import { encrypt, decrypt, extractCoordsFromUrl, getDistance } from './lib/utils';
+import { encrypt, decrypt, extractCoordsFromUrl, extractAddressFromUrl, getDistance } from './lib/utils';
 import type { Client, DecryptedClient, AppUser } from './types';
 
 const formatPhone = (phone: string) => {
   if (!phone) return '';
   const digits = phone.replace(/\D/g, '');
   return digits.slice(-10);
+};
+
+const CACHE_KEY = 'gmx_clients_cache';
+const CACHE_TIMESTAMP_KEY = 'gmx_clients_cache_time';
+
+const saveClientsToCache = (clientsData: Client[], key: string) => {
+  try {
+    const jsonStr = JSON.stringify(clientsData);
+    const encrypted = CryptoJS.AES.encrypt(jsonStr, key).toString();
+    localStorage.setItem(CACHE_KEY, encrypted);
+    localStorage.setItem(CACHE_TIMESTAMP_KEY, Date.now().toString());
+  } catch (e) {
+    console.error("Error saving cache", e);
+  }
+};
+
+const loadClientsFromCache = (key: string): Client[] | null => {
+  try {
+    const encrypted = localStorage.getItem(CACHE_KEY);
+    if (!encrypted) return null;
+    const bytes = CryptoJS.AES.decrypt(encrypted, key);
+    const jsonStr = bytes.toString(CryptoJS.enc.Utf8);
+    if (!jsonStr) return null;
+    return JSON.parse(jsonStr);
+  } catch (e) {
+    console.error("Error loading cache", e);
+    return null;
+  }
 };
 
 export default function App() {
@@ -51,11 +84,13 @@ export default function App() {
   const [authError, setAuthError] = useState<string | null>(null);
   const [username, setUsername] = useState('');
   const [password, setPassword] = useState('');
-  const [view, setView] = useState<'search' | 'admin' | 'settings'>('search');
+  const [view, setView] = useState<'search' | 'admin' | 'settings' | 'ranking'>('search');
+  const [isMenuOpen, setIsMenuOpen] = useState(false);
   const [clients, setClients] = useState<Client[]>([]);
   const [decryptedClients, setDecryptedClients] = useState<DecryptedClient[]>([]);
   const [searchQuery, setSearchQuery] = useState('');
   const [isAdding, setIsAdding] = useState(false);
+  const [editingClient, setEditingClient] = useState<DecryptedClient | null>(null);
   const [userLocation, setUserLocation] = useState<{ lat: number; lng: number } | null>(null);
   const [selectedClient, setSelectedClient] = useState<DecryptedClient | null>(null);
 
@@ -243,6 +278,16 @@ export default function App() {
     localStorage.setItem('gmx_search_query', searchQuery);
   }, [searchQuery]);
 
+  // Auto-fill address text from URL if empty
+  useEffect(() => {
+    if (newClientUrl && !newClientAddressText) {
+      const extractedAddress = extractAddressFromUrl(newClientUrl);
+      if (extractedAddress) {
+        setNewClientAddressText(extractedAddress);
+      }
+    }
+  }, [newClientUrl]);
+
   useEffect(() => {
     if (user?.role === 'superadmin') {
       localStorage.setItem('gmx_pending_admin', JSON.stringify({
@@ -338,15 +383,35 @@ export default function App() {
     }
   };
 
-  const fetchClients = async () => {
+  const fetchClients = async (force = false) => {
+    if (!masterKey) return;
+
+    if (!force) {
+      const cached = loadClientsFromCache(masterKey);
+      const cacheTime = localStorage.getItem(CACHE_TIMESTAMP_KEY);
+      if (cached && cacheTime) {
+        const ageHours = (Date.now() - parseInt(cacheTime)) / (1000 * 60 * 60);
+        if (ageHours < 24) {
+          setClients(cached);
+          return;
+        }
+      }
+    }
+
     try {
       const { data, error } = await supabase
         .from('clients')
-        .select('*')
+        .select('*, app_users(username)')
         .order('created_at', { ascending: false });
 
       if (error) throw error;
-      setClients(data || []);
+      const clientsData = data || [];
+      setClients(clientsData);
+      saveClientsToCache(clientsData, masterKey);
+      
+      if (force) {
+        addToast("Datos sincronizados", "success");
+      }
     } catch (err) {
       console.error('Error fetching clients:', err);
       addToast("Error al cargar clientes", "error");
@@ -369,17 +434,6 @@ export default function App() {
     if (user && masterKey) {
       fetchClients();
       fetchAdminUsers();
-      
-      const channel = supabase
-        .channel('schema-db-changes')
-        .on('postgres_changes', { event: '*', schema: 'public', table: 'clients' }, () => {
-          fetchClients();
-        })
-        .subscribe();
-
-      return () => {
-        supabase.removeChannel(channel);
-      };
     }
   }, [user, masterKey]);
 
@@ -412,6 +466,7 @@ export default function App() {
           references_text: decrypt(c.references_text || '', masterKey),
           lat,
           lng,
+          driver_name: c.app_users?.username || 'Desconocido'
         };
 
         if (userLocation && !isNaN(lat) && !isNaN(lng)) {
@@ -427,12 +482,34 @@ export default function App() {
 
   const filteredClients = useMemo(() => {
     if (!searchQuery.trim()) return [];
+    
+    const normalizeText = (text: string) => 
+      text.toLowerCase().normalize("NFD").replace(/[\u0300-\u036f]/g, "");
+      
+    const query = normalizeText(searchQuery);
+    
     return decryptedClients.filter(c => 
-      c.name.toLowerCase().includes(searchQuery.toLowerCase()) ||
+      normalizeText(c.name).includes(query) ||
       c.phone.includes(searchQuery) ||
       (c.additional_phones && c.additional_phones.includes(searchQuery))
     ).sort((a, b) => (a.distance || 0) - (b.distance || 0));
   }, [decryptedClients, searchQuery]);
+
+  const driverRanking = useMemo(() => {
+    const counts: Record<string, { count: number; name: string }> = {};
+    clients.forEach(c => {
+      const driverId = c.driver_id;
+      const driverName = c.app_users?.username || 'Desconocido';
+      if (!counts[driverId]) {
+        counts[driverId] = { count: 0, name: driverName };
+      }
+      counts[driverId].count += 1;
+    });
+    
+    return Object.values(counts)
+      .sort((a, b) => b.count - a.count)
+      .slice(0, 5);
+  }, [clients]);
 
   const handleSecureMyPassword = async () => {
     if (!user) return;
@@ -507,10 +584,15 @@ export default function App() {
       const { error } = await supabase.from('clients').delete().eq('id', id);
       if (error) throw error;
       
+      setClients(prev => {
+        const updated = prev.filter(c => c.id !== id);
+        saveClientsToCache(updated, masterKey!);
+        return updated;
+      });
+
       addToast("Cliente eliminado permanentemente", "success");
       setClientToDelete(null);
       setSelectedClient(null);
-      fetchClients();
     } catch (err: any) {
       addToast(err.message || "Error al eliminar cliente", "error");
     } finally {
@@ -556,8 +638,7 @@ export default function App() {
     const formattedAdditionalPhones = additionalPhoneTags.map(formatPhone).filter(Boolean).join(', ');
 
     try {
-      const { error } = await supabase.from('clients').insert({
-        driver_id: user.id,
+      const clientData = {
         encrypted_name: encrypt(finalName, masterKey),
         encrypted_phone: encrypt(formattedPhone, masterKey),
         additional_phones: encrypt(formattedAdditionalPhones, masterKey),
@@ -568,12 +649,49 @@ export default function App() {
         encrypted_delivery_notes: encrypt(newClientNotes, masterKey),
         rating: encrypt(newClientRating.toString(), masterKey),
         references_text: encrypt(newClientReferences, masterKey),
-      });
+      };
+
+      let error, newClientData;
+      if (editingClient) {
+        const { data, error: updateError } = await supabase
+          .from('clients')
+          .update(clientData)
+          .eq('id', editingClient.id)
+          .select('*, app_users(username)')
+          .single();
+        error = updateError;
+        newClientData = data;
+      } else {
+        const { data, error: insertError } = await supabase
+          .from('clients')
+          .insert({
+            driver_id: user.id,
+            ...clientData
+          })
+          .select('*, app_users(username)')
+          .single();
+        error = insertError;
+        newClientData = data;
+      }
 
       if (error) throw error;
 
-      addToast("Cliente registrado correctamente", "success");
+      if (newClientData) {
+        setClients(prev => {
+          let updated;
+          if (editingClient) {
+            updated = prev.map(c => c.id === newClientData.id ? newClientData : c);
+          } else {
+            updated = [newClientData, ...prev];
+          }
+          saveClientsToCache(updated, masterKey);
+          return updated;
+        });
+      }
+
+      addToast(editingClient ? "Cliente actualizado correctamente" : "Cliente registrado correctamente", "success");
       setIsAdding(false);
+      setEditingClient(null);
       setNewClientUrl('');
       setNewClientName('');
       setNewClientPhone('');
@@ -584,16 +702,45 @@ export default function App() {
       setNewClientReferences('');
       setNewClientRating(0);
       localStorage.removeItem('gmx_pending_client');
-      fetchClients();
+      
+      // Update selected client if it was the one being edited
+      if (editingClient && selectedClient && selectedClient.id === editingClient.id) {
+        setSelectedClient({
+          ...selectedClient,
+          name: finalName,
+          phone: formattedPhone,
+          additional_phones: formattedAdditionalPhones,
+          lat: coords.lat,
+          lng: coords.lng,
+          address_url: newClientUrl,
+          address_text: newClientAddressText,
+          notes: newClientNotes,
+          rating: newClientRating.toString(),
+          references_text: newClientReferences
+        });
+      }
     } catch (err: any) {
       if (err.message && err.message.includes('foreign key constraint')) {
         addToast("Error de sesión: Por favor cierra sesión y vuelve a entrar para actualizar tu acceso.", "error");
       } else {
-        addToast(err.message || "Error al registrar cliente", "error");
+        addToast(err.message || (editingClient ? "Error al actualizar cliente" : "Error al registrar cliente"), "error");
       }
     } finally {
       setIsSaving(false);
     }
+  };
+
+  const openEditModal = (client: DecryptedClient) => {
+    setEditingClient(client);
+    setNewClientUrl(client.address_url);
+    setNewClientName(client.name);
+    setNewClientPhone(client.phone);
+    setAdditionalPhoneTags(client.additional_phones ? client.additional_phones.split(',').map(p => p.trim()).filter(Boolean) : []);
+    setNewClientAddressText(client.address_text || '');
+    setNewClientNotes(client.notes || '');
+    setNewClientReferences(client.references_text || '');
+    setNewClientRating(client.rating ? parseInt(client.rating) : 0);
+    setIsAdding(true);
   };
 
   if (isAuthLoading) {
@@ -830,7 +977,7 @@ export default function App() {
           </div>
           <h1 className="text-2xl font-black tracking-tight text-white">GuíaMX</h1>
         </div>
-        <div className="flex items-center gap-1">
+        <div className="flex items-center gap-1 relative">
           {deferredPrompt && (
             <button 
               onClick={handleInstallClick}
@@ -842,28 +989,108 @@ export default function App() {
             </button>
           )}
           <button 
-            onClick={() => setView(view === 'settings' ? 'search' : 'settings')}
-            className={`flex h-10 w-10 items-center justify-center rounded-full transition-all ${view === 'settings' ? 'bg-white/20 text-white' : 'bg-white/10 text-white hover:bg-white/20'}`}
-            title="Configuración"
+            onClick={() => setIsMenuOpen(!isMenuOpen)}
+            className={`flex h-10 w-10 items-center justify-center rounded-full transition-all ${isMenuOpen ? 'bg-white/20 text-white' : 'bg-white/10 text-white hover:bg-white/20'}`}
+            title="Menú"
           >
-            <Settings className="h-5 w-5" />
+            <Menu className="h-5 w-5" />
           </button>
-          {user?.role === 'superadmin' && (
-            <button 
-              onClick={() => setView(view === 'admin' ? 'search' : 'admin')}
-              className={`flex h-10 w-10 items-center justify-center rounded-full transition-all ${view === 'admin' ? 'bg-white/20 text-white' : 'bg-white/10 text-white hover:bg-white/20'}`}
-              title="Administración"
-            >
-              <ShieldCheck className="h-5 w-5" />
-            </button>
-          )}
-          <button 
-            onClick={handleLogout}
-            className="flex h-10 w-10 items-center justify-center rounded-full bg-white/10 text-white hover:bg-white/20 transition-all"
-            title="Cerrar Sesión"
-          >
-            <LogOut className="h-5 w-5" />
-          </button>
+
+          {/* Dropdown Menu */}
+          <AnimatePresence>
+            {isMenuOpen && (
+              <>
+                <motion.div
+                  initial={{ opacity: 0 }}
+                  animate={{ opacity: 1 }}
+                  exit={{ opacity: 0 }}
+                  className="fixed inset-0 z-40"
+                  onClick={() => setIsMenuOpen(false)}
+                />
+                <motion.div
+                  initial={{ opacity: 0, y: -10, scale: 0.95 }}
+                  animate={{ opacity: 1, y: 0, scale: 1 }}
+                  exit={{ opacity: 0, y: -10, scale: 0.95 }}
+                  transition={{ duration: 0.15 }}
+                  className="absolute right-0 top-12 mt-2 w-56 origin-top-right rounded-2xl bg-white dark:bg-slate-900 shadow-xl ring-1 ring-black/5 dark:ring-white/10 z-50 overflow-hidden"
+                >
+                  <div className="p-2 space-y-1">
+                    {user && (
+                      <>
+                        <div className="px-3 py-2.5 text-sm font-bold text-slate-800 dark:text-slate-200">
+                          Hola, {user.username.charAt(0).toUpperCase() + user.username.slice(1)}
+                        </div>
+                        <div className="my-1 border-t border-slate-100 dark:border-slate-800" />
+                      </>
+                    )}
+                    <button
+                      onClick={() => {
+                        setView('search');
+                        setIsMenuOpen(false);
+                      }}
+                      className={`flex w-full items-center gap-3 rounded-xl px-3 py-2.5 text-sm font-bold transition-colors ${view === 'search' ? 'bg-blue-50 text-walmart-blue dark:bg-blue-900/20 dark:text-blue-400' : 'text-slate-700 hover:bg-slate-50 dark:text-slate-300 dark:hover:bg-slate-800'}`}
+                    >
+                      <Search className="h-4 w-4" />
+                      Página Principal
+                    </button>
+                    <button
+                      onClick={() => {
+                        fetchClients(true);
+                        setIsMenuOpen(false);
+                      }}
+                      className="flex w-full items-center gap-3 rounded-xl px-3 py-2.5 text-sm font-bold transition-colors text-slate-700 hover:bg-slate-50 dark:text-slate-300 dark:hover:bg-slate-800"
+                    >
+                      <RefreshCw className="h-4 w-4" />
+                      Sincronizar Datos
+                    </button>
+                    <button
+                      onClick={() => {
+                        setView('ranking');
+                        setIsMenuOpen(false);
+                      }}
+                      className={`flex w-full items-center gap-3 rounded-xl px-3 py-2.5 text-sm font-bold transition-colors ${view === 'ranking' ? 'bg-blue-50 text-walmart-blue dark:bg-blue-900/20 dark:text-blue-400' : 'text-slate-700 hover:bg-slate-50 dark:text-slate-300 dark:hover:bg-slate-800'}`}
+                    >
+                      <Trophy className="h-4 w-4" />
+                      Ranking
+                    </button>
+                    <button
+                      onClick={() => {
+                        setView('settings');
+                        setIsMenuOpen(false);
+                      }}
+                      className={`flex w-full items-center gap-3 rounded-xl px-3 py-2.5 text-sm font-bold transition-colors ${view === 'settings' ? 'bg-blue-50 text-walmart-blue dark:bg-blue-900/20 dark:text-blue-400' : 'text-slate-700 hover:bg-slate-50 dark:text-slate-300 dark:hover:bg-slate-800'}`}
+                    >
+                      <Settings className="h-4 w-4" />
+                      Ajustes
+                    </button>
+                    {user?.role === 'superadmin' && (
+                      <button
+                        onClick={() => {
+                          setView('admin');
+                          setIsMenuOpen(false);
+                        }}
+                        className={`flex w-full items-center gap-3 rounded-xl px-3 py-2.5 text-sm font-bold transition-colors ${view === 'admin' ? 'bg-blue-50 text-walmart-blue dark:bg-blue-900/20 dark:text-blue-400' : 'text-slate-700 hover:bg-slate-50 dark:text-slate-300 dark:hover:bg-slate-800'}`}
+                      >
+                        <ShieldCheck className="h-4 w-4" />
+                        Administración
+                      </button>
+                    )}
+                    <div className="my-1 border-t border-slate-100 dark:border-slate-800" />
+                    <button
+                      onClick={() => {
+                        handleLogout();
+                        setIsMenuOpen(false);
+                      }}
+                      className="flex w-full items-center gap-3 rounded-xl px-3 py-2.5 text-sm font-bold text-red-600 hover:bg-red-50 dark:text-red-400 dark:hover:bg-red-900/20 transition-colors"
+                    >
+                      <LogOut className="h-4 w-4" />
+                      Cerrar Sesión
+                    </button>
+                  </div>
+                </motion.div>
+              </>
+            )}
+          </AnimatePresence>
         </div>
       </header>
 
@@ -1110,6 +1337,64 @@ export default function App() {
                 </div>
               </div>
             </motion.div>
+          ) : view === 'ranking' ? (
+            <motion.div 
+              initial={{ opacity: 0, x: 20 }}
+              animate={{ opacity: 1, x: 0 }}
+              exit={{ opacity: 0, x: -20 }}
+              className="mx-auto max-w-2xl pt-8"
+            >
+              <div className="rounded-3xl bg-white dark:bg-slate-900 p-6 shadow-xl ring-1 ring-slate-100 dark:ring-slate-800">
+                <div className="flex items-center gap-3 mb-6">
+                  <div className="flex h-10 w-10 items-center justify-center rounded-xl bg-walmart-yellow text-walmart-blue">
+                    <Trophy className="h-5 w-5" />
+                  </div>
+                  <div>
+                    <h2 className="text-xl font-black text-slate-900 dark:text-white">Ranking de Conductores</h2>
+                    <p className="text-xs font-medium text-slate-500 dark:text-slate-400">Top 5 conductores con más clientes agregados</p>
+                  </div>
+                </div>
+                
+                <div className="space-y-4">
+                  {driverRanking.length === 0 ? (
+                    <p className="text-center text-slate-500 py-8">Aún no hay clientes registrados.</p>
+                  ) : (
+                    driverRanking.map((driver, index) => (
+                      <div 
+                        key={index}
+                        className={`flex items-center justify-between p-4 rounded-2xl border ${
+                          index === 0 ? 'bg-yellow-50 border-yellow-200 dark:bg-yellow-900/10 dark:border-yellow-900/30' :
+                          index === 1 ? 'bg-slate-50 border-slate-200 dark:bg-slate-800/50 dark:border-slate-700' :
+                          index === 2 ? 'bg-orange-50 border-orange-200 dark:bg-orange-900/10 dark:border-orange-900/30' :
+                          'bg-white border-slate-100 dark:bg-slate-900 dark:border-slate-800'
+                        }`}
+                      >
+                        <div className="flex items-center gap-4">
+                          <div className={`flex h-10 w-10 items-center justify-center rounded-full font-black text-lg ${
+                            index === 0 ? 'bg-yellow-400 text-yellow-900' :
+                            index === 1 ? 'bg-slate-300 text-slate-800' :
+                            index === 2 ? 'bg-orange-300 text-orange-900' :
+                            'bg-slate-100 text-slate-500 dark:bg-slate-800 dark:text-slate-400'
+                          }`}>
+                            #{index + 1}
+                          </div>
+                          <div>
+                            <p className="font-bold text-slate-900 dark:text-white">{driver.name}</p>
+                            <p className="text-xs text-slate-500 dark:text-slate-400">
+                              {index === 0 ? '🏆 Líder actual' : index < 3 ? '⭐ En el podio' : 'Conductor destacado'}
+                            </p>
+                          </div>
+                        </div>
+                        <div className="text-right">
+                          <p className="text-2xl font-black text-walmart-blue dark:text-blue-400">{driver.count}</p>
+                          <p className="text-[10px] uppercase font-bold text-slate-400">Clientes</p>
+                        </div>
+                      </div>
+                    ))
+                  )}
+                </div>
+              </div>
+            </motion.div>
           ) : (
             <motion.div 
               initial={{ opacity: 0, x: 20 }}
@@ -1219,14 +1504,32 @@ export default function App() {
       </main>
 
       {/* Floating Action Button - Walmart Yellow */}
-      <motion.button 
-        whileHover={{ scale: 1.05 }}
-        whileTap={{ scale: 0.95 }}
-        onClick={() => setIsAdding(true)}
-        className="fixed bottom-8 right-8 flex h-14 w-14 items-center justify-center rounded-full bg-walmart-yellow text-walmart-blue shadow-2xl z-40"
-      >
-        <Plus className="h-6 w-6" />
-      </motion.button>
+      <AnimatePresence>
+        {view === 'search' && (
+          <motion.button 
+            initial={{ opacity: 0, scale: 0.8 }}
+            animate={{ opacity: 1, scale: 1 }}
+            exit={{ opacity: 0, scale: 0.8 }}
+            whileHover={{ scale: 1.05 }}
+            whileTap={{ scale: 0.95 }}
+            onClick={() => {
+              setEditingClient(null);
+              setNewClientUrl('');
+              setNewClientName('');
+              setNewClientPhone('');
+              setAdditionalPhoneTags([]);
+              setNewClientAddressText('');
+              setNewClientNotes('');
+              setNewClientReferences('');
+              setNewClientRating(0);
+              setIsAdding(true);
+            }}
+            className="fixed bottom-8 right-8 flex h-14 w-14 items-center justify-center rounded-full bg-walmart-yellow text-walmart-blue shadow-2xl z-40"
+          >
+            <Plus className="h-6 w-6" />
+          </motion.button>
+        )}
+      </AnimatePresence>
 
       {/* Client Detail Modal */}
       <AnimatePresence>
@@ -1278,7 +1581,7 @@ export default function App() {
               </div>
 
               {/* Content */}
-              <div className="p-6 space-y-6 max-h-[65vh] overflow-y-auto">
+              <div className="p-5 space-y-5 max-h-[80vh] overflow-y-auto">
                 {/* Contact Section */}
                 <div className="space-y-3">
                   <h3 className="text-[10px] font-black text-slate-400 dark:text-slate-500 uppercase tracking-widest">Contacto</h3>
@@ -1341,15 +1644,19 @@ export default function App() {
                       </div>
                     )}
                     <div className="pt-2">
-                      <a 
+                      <motion.a 
+                        whileHover={{ scale: 1.02 }}
+                        whileTap={{ scale: 0.95 }}
+                        animate={{ y: [0, -4, 0] }}
+                        transition={{ duration: 1.5, repeat: Infinity, ease: "easeInOut" }}
                         href={`https://www.google.com/maps/dir/?api=1&destination=${selectedClient.lat},${selectedClient.lng}`}
                         target="_blank"
                         rel="noopener noreferrer"
-                        className="flex w-full items-center justify-center gap-2 rounded-xl bg-walmart-yellow py-3.5 text-sm font-black text-walmart-blue shadow-md hover:bg-yellow-400 active:scale-[0.98] transition-all"
+                        className="flex w-full items-center justify-center gap-2 rounded-xl bg-blue-600 py-3 text-sm font-black text-white shadow-md hover:bg-blue-700 transition-colors"
                       >
                         <Navigation size={18} />
                         INICIAR NAVEGACIÓN
-                      </a>
+                      </motion.a>
                     </div>
                   </div>
                 </div>
@@ -1365,14 +1672,22 @@ export default function App() {
                     </div>
                   </div>
                 )}
+                
+                {/* Added by info */}
+                {selectedClient.driver_name && (
+                  <div className="pt-2 pb-1 text-center">
+                    <p className="text-[10px] text-slate-400 dark:text-slate-500">
+                      Agregado por: <span className="font-bold">{selectedClient.driver_name}</span>
+                    </p>
+                  </div>
+                )}
               </div>
 
               {/* Footer Actions */}
-              <div className="p-4 bg-slate-50 dark:bg-slate-800/50 border-t border-slate-100 dark:border-slate-800 flex flex-col sm:flex-row gap-3">
-                <div className="flex flex-1 gap-3">
-                  <button 
-                    onClick={() => {
-                      const shareText = `*Cliente:* ${selectedClient.name}
+              <div className="p-3 bg-slate-50 dark:bg-slate-800/50 border-t border-slate-100 dark:border-slate-800 flex gap-2">
+                <button 
+                  onClick={() => {
+                    const shareText = `*Cliente:* ${selectedClient.name}
 *Teléfono:* ${formatPhone(selectedClient.phone)}
 ${selectedClient.additional_phones ? `*Teléfonos adicionales:* ${selectedClient.additional_phones.split(',').map(p => formatPhone(p)).join(', ')}\n` : ''}
 *Dirección:*
@@ -1389,42 +1704,47 @@ ${selectedClient.delivery_notes || 'No especificadas'}
 
 *Calificación:* ${selectedClient.rating ? `${selectedClient.rating} estrellas` : 'Sin calificación'}`;
 
-                      const shareData = {
-                        title: `Información de ${selectedClient.name}`,
-                        text: shareText,
-                      };
-                      if (navigator.share) {
-                        navigator.share(shareData).catch((e) => {
-                          if (e.name !== 'AbortError') {
-                            console.error('Error sharing:', e);
-                            addToast("Error al compartir", "error");
-                          }
-                        });
-                      } else {
-                        navigator.clipboard.writeText(shareData.text);
-                        addToast("Información copiada al portapapeles", "success");
-                      }
-                    }}
-                    className="flex-1 py-3 rounded-xl font-bold bg-walmart-blue text-white shadow-md hover:bg-blue-700 active:scale-[0.98] transition-all flex items-center justify-center gap-2"
-                  >
-                    <ExternalLink size={18} />
-                    Compartir
-                  </button>
-                  <button 
-                    onClick={() => setSelectedClient(null)}
-                    className="flex-1 py-3 rounded-xl font-bold text-slate-500 dark:text-slate-400 hover:bg-slate-100 dark:hover:bg-slate-800 transition-colors"
-                  >
-                    Cerrar
-                  </button>
-                </div>
+                    const shareData = {
+                      title: `Información de ${selectedClient.name}`,
+                      text: shareText,
+                    };
+                    if (navigator.share) {
+                      navigator.share(shareData).catch((e) => {
+                        if (e.name !== 'AbortError') {
+                          console.error('Error sharing:', e);
+                          addToast("Error al compartir", "error");
+                        }
+                      });
+                    } else {
+                      navigator.clipboard.writeText(shareData.text);
+                      addToast("Información copiada al portapapeles", "success");
+                    }
+                  }}
+                  className="flex-1 py-2 rounded-xl text-sm font-bold bg-walmart-blue text-white shadow-sm hover:bg-blue-700 active:scale-[0.98] transition-all flex items-center justify-center gap-2"
+                >
+                  <ExternalLink size={16} />
+                  Compartir
+                </button>
                 {user?.role === 'superadmin' && (
-                  <button 
-                    onClick={() => setClientToDelete(selectedClient.id)}
-                    className="py-3 px-4 rounded-xl font-bold text-red-600 bg-red-50 dark:bg-red-900/20 hover:bg-red-100 dark:hover:bg-red-900/40 transition-colors flex items-center justify-center gap-2"
-                  >
-                    <Trash2 size={18} />
-                    Eliminar
-                  </button>
+                  <>
+                    <button 
+                      onClick={() => {
+                        setSelectedClient(null);
+                        openEditModal(selectedClient);
+                      }}
+                      className="flex-1 py-2 rounded-xl text-sm font-bold text-blue-600 bg-blue-50 dark:bg-blue-900/20 hover:bg-blue-100 dark:hover:bg-blue-900/40 transition-colors flex items-center justify-center gap-2"
+                    >
+                      <Edit2 size={16} />
+                      Editar
+                    </button>
+                    <button 
+                      onClick={() => setClientToDelete(selectedClient.id)}
+                      className="flex-1 py-2 rounded-xl text-sm font-bold text-red-600 bg-red-50 dark:bg-red-900/20 hover:bg-red-100 dark:hover:bg-red-900/40 transition-colors flex items-center justify-center gap-2"
+                    >
+                      <Trash2 size={16} />
+                      Eliminar
+                    </button>
+                  </>
                 )}
               </div>
             </motion.div>
@@ -1494,10 +1814,10 @@ ${selectedClient.delivery_notes || 'No especificadas'}
             >
               <div className="mb-6 flex items-center justify-between">
                 <div>
-                  <h2 className="text-2xl font-black text-slate-900 dark:text-white">Nuevo Registro</h2>
-                  <p className="text-xs font-medium text-slate-500 dark:text-slate-400">Registra un nuevo punto de destino</p>
+                  <h2 className="text-2xl font-black text-slate-900 dark:text-white">{editingClient ? 'Editar Registro' : 'Nuevo Registro'}</h2>
+                  <p className="text-xs font-medium text-slate-500 dark:text-slate-400">{editingClient ? 'Modifica los datos del cliente' : 'Registra un nuevo punto de destino'}</p>
                 </div>
-                <button onClick={() => setIsAdding(false)} className="rounded-full bg-slate-100 dark:bg-slate-800 p-2 hover:bg-slate-200 dark:hover:bg-slate-700 transition-colors">
+                <button onClick={() => { setIsAdding(false); setEditingClient(null); }} className="rounded-full bg-slate-100 dark:bg-slate-800 p-2 hover:bg-slate-200 dark:hover:bg-slate-700 transition-colors">
                   <X className="h-5 w-5 text-slate-500 dark:text-slate-400" />
                 </button>
               </div>
@@ -1648,8 +1968,8 @@ ${selectedClient.delivery_notes || 'No especificadas'}
                   type="submit"
                   className="flex w-full items-center justify-center gap-2 rounded-xl bg-walmart-blue py-3.5 font-black text-white shadow-lg hover:bg-blue-700 active:scale-[0.98] transition-all disabled:opacity-50 text-sm"
                 >
-                  {isSaving ? <Loader2 className="h-5 w-5 animate-spin" /> : <Plus className="h-5 w-5" />}
-                  GUARDAR REGISTRO
+                  {isSaving ? <Loader2 className="h-5 w-5 animate-spin" /> : (editingClient ? <Edit2 className="h-5 w-5" /> : <Plus className="h-5 w-5" />)}
+                  {editingClient ? 'ACTUALIZAR REGISTRO' : 'GUARDAR REGISTRO'}
                 </button>
               </form>
             </motion.div>

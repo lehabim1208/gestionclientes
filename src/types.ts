@@ -12,6 +12,9 @@ export interface Client {
   rating?: string;
   references_text?: string;
   created_at: string;
+  app_users?: {
+    username: string;
+  };
 }
 
 export interface DecryptedClient {
@@ -27,6 +30,7 @@ export interface DecryptedClient {
   lat: number;
   lng: number;
   distance?: number;
+  driver_name?: string;
 }
 
 export interface AppUser {

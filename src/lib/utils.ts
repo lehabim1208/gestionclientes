@@ -72,6 +72,37 @@ export const extractCoordsFromUrl = (url: string): { lat: number; lng: number } 
 };
 
 /**
+ * Extracts an address string from a Google Maps URL if present.
+ */
+export const extractAddressFromUrl = (url: string): string | null => {
+  try {
+    const urlObj = new URL(url);
+    
+    // Pattern 1: /maps/place/Address+Here/...
+    const placeMatch = urlObj.pathname.match(/\/maps\/place\/([^/]+)/);
+    if (placeMatch && placeMatch[1]) {
+      // Decode URI component and replace '+' with spaces
+      let address = decodeURIComponent(placeMatch[1]).replace(/\+/g, ' ');
+      // Remove trailing coordinates if they got caught
+      address = address.replace(/@.*/, '');
+      return address.trim();
+    }
+    
+    // Pattern 2: ?q=Address+Here
+    const qParam = urlObj.searchParams.get('q');
+    if (qParam) {
+      // Check if it's not just coordinates
+      if (!/^-?\d+\.\d+,-?\d+\.\d+$/.test(qParam)) {
+        return qParam.trim();
+      }
+    }
+  } catch (e) {
+    // Invalid URL
+  }
+  return null;
+};
+
+/**
  * Calculates the distance between two points in kilometers using the Haversine formula.
  */
 export const getDistance = (lat1: number, lon1: number, lat2: number, lon2: number): number => {
