@@ -1,0 +1,5 @@
+{
+  "name": "GuíaMX",
+  "description": "Herramienta de precisión logística para drivers de última milla con cifrado de extremo a extremo.",
+  "requestFramePermissions": ["geolocation"]
+}
