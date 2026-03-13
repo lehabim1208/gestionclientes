@@ -783,7 +783,6 @@ export default function App() {
           <div className="mt-8 space-y-4">
             <div className="relative">
               <input
-                autoFocus
                 type={showMasterKey ? "text" : "password"}
                 className="block w-full rounded-2xl border-0 py-4 pl-4 pr-12 text-center text-2xl tracking-widest text-slate-900 ring-1 ring-inset ring-slate-200 focus:ring-2 focus:ring-walmart-blue transition-all"
                 placeholder="••••••"
