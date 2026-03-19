@@ -14,8 +14,8 @@ export default defineConfig(({mode}) => {
         registerType: 'autoUpdate',
         includeAssets: ['pwa-192x192.svg', 'pwa-512x512.svg'],
         manifest: {
-          name: 'Gestión de Clientes',
-          short_name: 'Clientes',
+          name: 'GuiaMX',
+          short_name: 'GuiaMX',
           description: 'Aplicación para gestionar clientes y ubicaciones',
           theme_color: '#0071ce',
           background_color: '#ffffff',

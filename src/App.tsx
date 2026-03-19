@@ -109,6 +109,7 @@ export default function App() {
   const [editUsername, setEditUsername] = useState('');
   const [editEmail, setEditEmail] = useState('');
   const [editPassword, setEditPassword] = useState('');
+  const [showEditPassword, setShowEditPassword] = useState(false);
   const [isEditingUser, setIsEditingUser] = useState(false);
 
   // Form states for adding client
@@ -124,6 +125,8 @@ export default function App() {
   const [isSaving, setIsSaving] = useState(false);
   const [isDeletingClient, setIsDeletingClient] = useState(false);
   const [clientToDelete, setClientToDelete] = useState<string | null>(null);
+  const [isDeletingUser, setIsDeletingUser] = useState(false);
+  const [userToDelete, setUserToDelete] = useState<string | null>(null);
   const [toasts, setToasts] = useState<{ id: number; message: string; type: 'success' | 'error' | 'info' }[]>([]);
   const [themePreference, setThemePreference] = useState<'light' | 'dark' | 'system'>(() => {
     const saved = localStorage.getItem('gmx_theme_pref');
@@ -208,6 +211,14 @@ export default function App() {
   const [newPassword, setNewPassword] = useState('');
   const [confirmPassword, setConfirmPassword] = useState('');
   const [verifiedUser, setVerifiedUser] = useState<AppUser | null>(null);
+  
+  // New state variables for verification flow
+  const [showNewPassword, setShowNewPassword] = useState(false);
+  const [showConfirmPassword, setShowConfirmPassword] = useState(false);
+  const [verificationStep, setVerificationStep] = useState<'password' | 'username'>('password');
+  const [wantsToChangeUsername, setWantsToChangeUsername] = useState(false);
+  const [newUsername, setNewUsername] = useState('');
+  const [isChangingUsername, setIsChangingUsername] = useState(false);
 
   const checkVerificationToken = async (token: string) => {
     setIsAuthLoading(true);
@@ -443,7 +454,7 @@ export default function App() {
         .from('app_users')
         .select('*')
         .or(`username.eq.${username},email.eq.${username}`)
-        .single();
+        .maybeSingle();
 
       if (error || !data) {
         addToast("Usuario o correo no encontrado", "error");
@@ -541,8 +552,8 @@ export default function App() {
       const cached = loadClientsFromCache(currentKey);
       const cacheTime = localStorage.getItem(CACHE_TIMESTAMP_KEY);
       if (cached && cacheTime) {
-        const ageHours = (Date.now() - parseInt(cacheTime)) / (1000 * 60 * 60);
-        if (ageHours < 24) {
+        const ageMinutes = (Date.now() - parseInt(cacheTime)) / (1000 * 60);
+        if (ageMinutes < 5) {
           setClients(cached);
           return;
         }
@@ -600,6 +611,15 @@ export default function App() {
       fetchAdminUsers();
     }
   }, [user, masterKey]);
+
+  useEffect(() => {
+    if (user && masterKey && searchQuery.length > 2) {
+      const timer = setTimeout(() => {
+        fetchClients(false);
+      }, 500);
+      return () => clearTimeout(timer);
+    }
+  }, [searchQuery, user, masterKey]);
 
   useEffect(() => {
     if (navigator.geolocation) {
@@ -723,6 +743,19 @@ export default function App() {
     setIsAdminCreating(true);
 
     try {
+      // Check if email already exists
+      const { data: existingUser, error: checkError } = await supabase
+        .from('app_users')
+        .select('id')
+        .eq('email', adminNewEmail)
+        .maybeSingle();
+
+      if (existingUser) {
+        addToast("Este correo ya está registrado en el sistema", "error");
+        setIsAdminCreating(false);
+        return;
+      }
+
       // Generate a random verification token
       const token = Array.from(crypto.getRandomValues(new Uint8Array(32)))
         .map(b => b.toString(16).padStart(2, '0'))
@@ -866,7 +899,7 @@ export default function App() {
 
   const handleDeleteUser = async (id: string) => {
     if (user?.role !== 'superadmin') return;
-    if (!confirm("¿Eliminar este conductor?")) return;
+    setIsDeletingUser(true);
     try {
       const { error } = await supabase.from('app_users').delete().eq('id', id);
       if (error) throw error;
@@ -874,6 +907,9 @@ export default function App() {
       fetchAdminUsers();
     } catch (err: any) {
       addToast(err.message || "Error al eliminar conductor", "error");
+    } finally {
+      setIsDeletingUser(false);
+      setUserToDelete(null);
     }
   };
 
@@ -1211,15 +1247,56 @@ export default function App() {
 
       if (error) throw error;
       
-      addToast("Cuenta verificada y contraseña establecida. Ahora puedes iniciar sesión.", "success");
-      setVerificationToken(null);
-      setVerifiedUser(null);
-      // Remove token from URL
-      window.history.replaceState({}, document.title, window.location.pathname);
+      addToast("Contraseña establecida correctamente.", "success");
+      setVerificationStep('username');
+      setNewUsername(verifiedUser?.username || '');
     } catch (err) {
       setVerificationError("Error al establecer la contraseña.");
     } finally {
       setIsVerifying(false);
+    }
+  };
+
+  const handleSetUsername = async (e: React.FormEvent, skipChange: boolean = false) => {
+    e.preventDefault();
+    if (!verifiedUser) return;
+    
+    setIsChangingUsername(true);
+    try {
+      const shouldChange = !skipChange && wantsToChangeUsername;
+      
+      if (shouldChange && newUsername.trim() !== '' && newUsername !== verifiedUser.username) {
+        // Check if username exists
+        const { data: existingUser } = await supabase
+          .from('app_users')
+          .select('id')
+          .eq('username', newUsername.trim())
+          .maybeSingle();
+          
+        if (existingUser) {
+          addToast("El nombre de usuario ya está en uso", "error");
+          setIsChangingUsername(false);
+          return;
+        }
+        
+        const { error } = await supabase
+          .from('app_users')
+          .update({ username: newUsername.trim() })
+          .eq('id', verifiedUser.id);
+          
+        if (error) throw error;
+      }
+      
+      addToast("Cuenta configurada correctamente. Ahora puedes iniciar sesión.", "success");
+      setVerificationToken(null);
+      setVerifiedUser(null);
+      setVerificationStep('password');
+      // Remove token from URL
+      window.history.replaceState({}, document.title, window.location.pathname);
+    } catch (err: any) {
+      addToast(err.message || "Error al actualizar el usuario", "error");
+    } finally {
+      setIsChangingUsername(false);
     }
   };
 
@@ -1250,38 +1327,121 @@ export default function App() {
               </button>
             </div>
           ) : verifiedUser ? (
-            <form onSubmit={handleSetPassword} className="space-y-6">
-              <p className="text-center text-gray-600 dark:text-gray-400">
-                Hola <strong>{verifiedUser.email}</strong>, establece tu contraseña para activar tu cuenta.
-              </p>
-              <div>
-                <label className="mb-2 block text-sm font-medium text-gray-700 dark:text-gray-300">Nueva Contraseña</label>
-                <input
-                  type="password"
-                  value={newPassword}
-                  onChange={(e) => setNewPassword(e.target.value)}
-                  className="w-full rounded-xl border-0 bg-gray-50 px-4 py-3 text-gray-900 ring-1 ring-inset ring-gray-300 focus:ring-2 focus:ring-inset focus:ring-blue-600 dark:bg-gray-900 dark:text-white dark:ring-gray-700"
-                  required
-                />
-              </div>
-              <div>
-                <label className="mb-2 block text-sm font-medium text-gray-700 dark:text-gray-300">Confirmar Contraseña</label>
-                <input
-                  type="password"
-                  value={confirmPassword}
-                  onChange={(e) => setConfirmPassword(e.target.value)}
-                  className="w-full rounded-xl border-0 bg-gray-50 px-4 py-3 text-gray-900 ring-1 ring-inset ring-gray-300 focus:ring-2 focus:ring-inset focus:ring-blue-600 dark:bg-gray-900 dark:text-white dark:ring-gray-700"
-                  required
-                />
-              </div>
-              <button
-                type="submit"
-                disabled={isVerifying}
-                className="w-full rounded-xl bg-blue-600 py-3 font-bold text-white shadow-lg shadow-blue-600/20 transition-all hover:bg-blue-700 active:scale-[0.98] disabled:opacity-70"
-              >
-                {isVerifying ? 'Guardando...' : 'Establecer Contraseña'}
-              </button>
-            </form>
+            verificationStep === 'password' ? (
+              <form onSubmit={handleSetPassword} className="space-y-6">
+                <p className="text-center text-gray-600 dark:text-gray-400">
+                  Hola <strong>{verifiedUser.email}</strong>, establece tu contraseña para activar tu cuenta.
+                </p>
+                <div>
+                  <label className="mb-2 block text-sm font-medium text-gray-700 dark:text-gray-300">Nueva Contraseña</label>
+                  <div className="relative">
+                    <input
+                      type={showNewPassword ? "text" : "password"}
+                      value={newPassword}
+                      onChange={(e) => setNewPassword(e.target.value)}
+                      className="w-full rounded-xl border-0 bg-gray-50 px-4 py-3 pr-12 text-gray-900 ring-1 ring-inset ring-gray-300 focus:ring-2 focus:ring-inset focus:ring-blue-600 dark:bg-gray-900 dark:text-white dark:ring-gray-700"
+                      required
+                    />
+                    <button
+                      type="button"
+                      onClick={() => setShowNewPassword(!showNewPassword)}
+                      className="absolute right-3 top-1/2 -translate-y-1/2 text-gray-400 hover:text-gray-600 dark:hover:text-gray-300"
+                    >
+                      {showNewPassword ? <EyeOff className="h-5 w-5" /> : <Eye className="h-5 w-5" />}
+                    </button>
+                  </div>
+                </div>
+                <div>
+                  <label className="mb-2 block text-sm font-medium text-gray-700 dark:text-gray-300">Confirmar Contraseña</label>
+                  <div className="relative">
+                    <input
+                      type={showConfirmPassword ? "text" : "password"}
+                      value={confirmPassword}
+                      onChange={(e) => setConfirmPassword(e.target.value)}
+                      className="w-full rounded-xl border-0 bg-gray-50 px-4 py-3 pr-12 text-gray-900 ring-1 ring-inset ring-gray-300 focus:ring-2 focus:ring-inset focus:ring-blue-600 dark:bg-gray-900 dark:text-white dark:ring-gray-700"
+                      required
+                    />
+                    <button
+                      type="button"
+                      onClick={() => setShowConfirmPassword(!showConfirmPassword)}
+                      className="absolute right-3 top-1/2 -translate-y-1/2 text-gray-400 hover:text-gray-600 dark:hover:text-gray-300"
+                    >
+                      {showConfirmPassword ? <EyeOff className="h-5 w-5" /> : <Eye className="h-5 w-5" />}
+                    </button>
+                  </div>
+                </div>
+                <button
+                  type="submit"
+                  disabled={isVerifying}
+                  className="w-full rounded-xl bg-blue-600 py-3 font-bold text-white shadow-lg shadow-blue-600/20 transition-all hover:bg-blue-700 active:scale-[0.98] disabled:opacity-70"
+                >
+                  {isVerifying ? 'Guardando...' : 'Establecer Contraseña'}
+                </button>
+              </form>
+            ) : (
+              <form onSubmit={handleSetUsername} className="space-y-6">
+                <div className="rounded-2xl bg-blue-50 p-6 dark:bg-blue-900/20">
+                  <p className="text-center text-gray-700 dark:text-gray-300 mb-4">
+                    Tu usuario es <strong className="text-blue-600 dark:text-blue-400">{verifiedUser.username}</strong>
+                  </p>
+                  <p className="text-center text-sm font-medium text-gray-900 dark:text-white mb-6">
+                    ¿Deseas cambiarlo?
+                  </p>
+                  
+                  <div className="flex gap-3 mb-6">
+                    <button
+                      type="button"
+                      onClick={() => {
+                        setWantsToChangeUsername(false);
+                        // Trigger form submission manually since we're bypassing the input
+                        const fakeEvent = { preventDefault: () => {} } as React.FormEvent;
+                        handleSetUsername(fakeEvent, true);
+                      }}
+                      className={`flex-1 rounded-xl py-3 font-bold transition-all ${!wantsToChangeUsername ? 'bg-blue-600 text-white shadow-lg shadow-blue-600/20' : 'bg-white text-gray-700 ring-1 ring-inset ring-gray-300 hover:bg-gray-50 dark:bg-gray-800 dark:text-gray-300 dark:ring-gray-700 dark:hover:bg-gray-700'}`}
+                    >
+                      No
+                    </button>
+                    <button
+                      type="button"
+                      onClick={() => setWantsToChangeUsername(true)}
+                      className={`flex-1 rounded-xl py-3 font-bold transition-all ${wantsToChangeUsername ? 'bg-blue-600 text-white shadow-lg shadow-blue-600/20' : 'bg-white text-gray-700 ring-1 ring-inset ring-gray-300 hover:bg-gray-50 dark:bg-gray-800 dark:text-gray-300 dark:ring-gray-700 dark:hover:bg-gray-700'}`}
+                    >
+                      Sí
+                    </button>
+                  </div>
+
+                  <AnimatePresence>
+                    {wantsToChangeUsername && (
+                      <motion.div
+                        initial={{ height: 0, opacity: 0 }}
+                        animate={{ height: 'auto', opacity: 1 }}
+                        exit={{ height: 0, opacity: 0 }}
+                        className="overflow-hidden"
+                      >
+                        <div className="pt-2 pb-4">
+                          <label className="mb-2 block text-sm font-medium text-gray-700 dark:text-gray-300">Nuevo Usuario</label>
+                          <input
+                            type="text"
+                            value={newUsername}
+                            onChange={(e) => setNewUsername(e.target.value)}
+                            className="w-full rounded-xl border-0 bg-white px-4 py-3 text-gray-900 ring-1 ring-inset ring-gray-300 focus:ring-2 focus:ring-inset focus:ring-blue-600 dark:bg-gray-900 dark:text-white dark:ring-gray-700"
+                            placeholder="Escribe tu nuevo usuario"
+                            required={wantsToChangeUsername}
+                          />
+                        </div>
+                        <button
+                          type="submit"
+                          disabled={isChangingUsername || newUsername.trim() === ''}
+                          className="w-full rounded-xl bg-blue-600 py-3 font-bold text-white shadow-lg shadow-blue-600/20 transition-all hover:bg-blue-700 active:scale-[0.98] disabled:opacity-70"
+                        >
+                          {isChangingUsername ? 'Guardando...' : 'Guardar y Continuar'}
+                        </button>
+                      </motion.div>
+                    )}
+                  </AnimatePresence>
+                </div>
+              </form>
+            )
           ) : (
             <div className="flex justify-center py-8">
               <Loader2 className="h-8 w-8 animate-spin text-blue-600" />
@@ -1311,7 +1471,7 @@ export default function App() {
             >
               <Navigation className="h-10 w-10" />
             </motion.div>
-            <h2 className="mt-6 text-4xl font-black tracking-tight text-slate-900 dark:text-white">GuíaMX</h2>
+            <h2 className="mt-6 text-4xl font-black tracking-tight text-slate-900 dark:text-white">GuiaMX</h2>
             <p className="mt-2 text-sm font-medium text-slate-500 dark:text-slate-400">Logística de precisión para drivers</p>
           </div>
           <form className="mt-8 space-y-4" onSubmit={handleLogin}>
@@ -1457,7 +1617,7 @@ export default function App() {
             <Navigation className="h-6 w-6" />
           </div>
           <h1 className="text-2xl font-black tracking-tight text-white flex items-center gap-2">
-            GuíaMX
+            GuiaMX
             {isOffline && (
               <span className="inline-flex items-center gap-1 rounded-full bg-red-500/20 px-2 py-0.5 text-xs font-bold text-red-100 ring-1 ring-red-500/50">
                 <WifiOff className="h-3 w-3" />
@@ -1796,7 +1956,7 @@ export default function App() {
                 <div className="rounded-3xl bg-white dark:bg-slate-900 p-6 shadow-xl ring-1 ring-slate-100 dark:ring-slate-800 md:col-span-2">
                   <div className="flex items-center justify-between mb-6">
                     <h3 className="text-lg font-black text-slate-900 dark:text-white">Conductores Registrados</h3>
-                    <span className="rounded-full bg-blue-100 dark:bg-blue-900/30 px-3 py-1 text-xs font-bold text-walmart-blue dark:text-blue-400">
+                    <span className="whitespace-nowrap rounded-full bg-blue-100 dark:bg-blue-900/30 px-3 py-1 text-xs font-bold text-walmart-blue dark:text-blue-400">
                       {adminUsers.length} Total
                     </span>
                   </div>
@@ -1857,6 +2017,8 @@ export default function App() {
                               setEditUsername(u.username);
                               setEditEmail(u.email || '');
                               setEditPassword('');
+                              setShowEditPassword(false);
+                              setIsEditingUser(true);
                             }}
                             className="p-2 text-blue-400 hover:text-blue-600 hover:bg-blue-50 dark:hover:bg-blue-900/20 rounded-lg transition-all"
                             title="Editar usuario"
@@ -1872,7 +2034,7 @@ export default function App() {
                                 {u.is_active ? 'Desactivar' : 'Activar'}
                               </button>
                               <button 
-                                onClick={() => handleDeleteUser(u.id)}
+                                onClick={() => setUserToDelete(u.id)}
                                 className="p-2 text-red-400 hover:text-red-600 hover:bg-red-50 dark:hover:bg-red-900/20 rounded-lg transition-all"
                               >
                                 <Trash2 className="h-4 w-4" />
@@ -2351,6 +2513,51 @@ ${selectedClient.delivery_notes || 'No especificadas'}
         )}
       </AnimatePresence>
 
+      {/* Delete User Confirmation Modal */}
+      <AnimatePresence>
+        {userToDelete && (
+          <motion.div 
+            initial={{ opacity: 0 }}
+            animate={{ opacity: 1 }}
+            exit={{ opacity: 0 }}
+            className="fixed inset-0 z-[60] flex items-center justify-center bg-slate-900/60 backdrop-blur-sm p-4"
+            onClick={() => setUserToDelete(null)}
+          >
+            <motion.div 
+              initial={{ scale: 0.9, opacity: 0, y: 20 }}
+              animate={{ scale: 1, opacity: 1, y: 0 }}
+              exit={{ scale: 0.9, opacity: 0, y: 20 }}
+              className="w-full max-w-sm rounded-3xl bg-white dark:bg-slate-900 p-6 shadow-2xl text-center"
+              onClick={(e) => e.stopPropagation()}
+            >
+              <div className="mx-auto flex h-16 w-16 items-center justify-center rounded-full bg-red-100 dark:bg-red-900/30 text-red-600 dark:text-red-500 mb-4">
+                <AlertCircle size={32} />
+              </div>
+              <h3 className="text-xl font-black text-slate-900 dark:text-white mb-2">¿Eliminar conductor?</h3>
+              <p className="text-sm text-slate-500 dark:text-slate-400 mb-6">
+                Esta acción es permanente y no se puede deshacer. Se borrará el registro de la base de datos.
+              </p>
+              <div className="flex gap-3">
+                <button 
+                  onClick={() => setUserToDelete(null)}
+                  disabled={isDeletingUser}
+                  className="flex-1 py-3 rounded-xl font-bold text-slate-600 dark:text-slate-300 bg-slate-100 dark:bg-slate-800 hover:bg-slate-200 dark:hover:bg-slate-700 transition-colors disabled:opacity-50"
+                >
+                  Cancelar
+                </button>
+                <button 
+                  onClick={() => handleDeleteUser(userToDelete)}
+                  disabled={isDeletingUser}
+                  className="flex-1 py-3 rounded-xl font-bold text-white bg-red-600 hover:bg-red-700 shadow-md shadow-red-600/20 transition-all flex items-center justify-center gap-2 disabled:opacity-50"
+                >
+                  {isDeletingUser ? <Loader2 size={18} className="animate-spin" /> : 'Eliminar'}
+                </button>
+              </div>
+            </motion.div>
+          </motion.div>
+        )}
+      </AnimatePresence>
+
       {/* Add Client Modal */}
       <AnimatePresence>
         {isAdding && (
@@ -2582,13 +2789,22 @@ ${selectedClient.delivery_notes || 'No especificadas'}
                   </div>
                   <div>
                     <label className="block text-[10px] font-black uppercase tracking-wider text-slate-400 mb-1">Nueva Contraseña (Opcional)</label>
-                    <input
-                      type="password"
-                      placeholder="Dejar en blanco para no cambiar"
-                      className="block w-full rounded-xl border-0 py-3 px-4 text-slate-900 dark:text-white bg-slate-50 dark:bg-slate-800 ring-1 ring-inset ring-slate-200 dark:ring-slate-700 focus:ring-2 focus:ring-walmart-blue transition-all"
-                      value={editPassword}
-                      onChange={(e) => setEditPassword(e.target.value)}
-                    />
+                    <div className="relative">
+                      <input
+                        type={showEditPassword ? "text" : "password"}
+                        placeholder="Dejar en blanco para no cambiar"
+                        className="block w-full rounded-xl border-0 py-3 px-4 pr-12 text-slate-900 dark:text-white bg-slate-50 dark:bg-slate-800 ring-1 ring-inset ring-slate-200 dark:ring-slate-700 focus:ring-2 focus:ring-walmart-blue transition-all"
+                        value={editPassword}
+                        onChange={(e) => setEditPassword(e.target.value)}
+                      />
+                      <button
+                        type="button"
+                        onClick={() => setShowEditPassword(!showEditPassword)}
+                        className="absolute right-3 top-1/2 -translate-y-1/2 text-slate-400 hover:text-slate-600 dark:hover:text-slate-300"
+                      >
+                        {showEditPassword ? <EyeOff className="h-5 w-5" /> : <Eye className="h-5 w-5" />}
+                      </button>
+                    </div>
                   </div>
                 </div>
 
