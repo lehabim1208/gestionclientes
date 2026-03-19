@@ -31,7 +31,6 @@ import {
   Download,
   Menu,
   Trophy,
-  Search,
   Edit2,
   RefreshCw
 } from 'lucide-react';
@@ -375,19 +374,22 @@ export default function App() {
   };
 
   const handleSetMasterKey = (key: string) => {
-    setMasterKey(key);
+    const trimmedKey = key.trim();
+    setMasterKey(trimmedKey);
     const pass = localStorage.getItem('gmx_pass');
     if (pass) {
-      saveMasterKeyToCookie(key, pass);
+      saveMasterKeyToCookie(trimmedKey, pass);
       addToast("Llave maestra guardada", "success");
     }
+    // Force re-decryption by triggering fetchClients
+    fetchClients(true, trimmedKey);
   };
 
-  const fetchClients = async (force = false) => {
-    if (!masterKey) return;
+  const fetchClients = async (force = false, currentKey = masterKey) => {
+    if (!currentKey) return;
 
     if (!force) {
-      const cached = loadClientsFromCache(masterKey);
+      const cached = loadClientsFromCache(currentKey);
       const cacheTime = localStorage.getItem(CACHE_TIMESTAMP_KEY);
       if (cached && cacheTime) {
         const ageHours = (Date.now() - parseInt(cacheTime)) / (1000 * 60 * 60);
@@ -407,7 +409,7 @@ export default function App() {
       if (error) throw error;
       const clientsData = data || [];
       setClients(clientsData);
-      saveClientsToCache(clientsData, masterKey);
+      saveClientsToCache(clientsData, currentKey);
       
       if (force) {
         addToast("Datos sincronizados", "success");
@@ -492,7 +494,7 @@ export default function App() {
       normalizeText(c.name).includes(query) ||
       c.phone.includes(searchQuery) ||
       (c.additional_phones && c.additional_phones.includes(searchQuery))
-    ).sort((a, b) => (a.distance || 0) - (b.distance || 0));
+    ).sort((a, b) => (a.distance ?? Infinity) - (b.distance ?? Infinity));
   }, [decryptedClients, searchQuery]);
 
   const driverRanking = useMemo(() => {
@@ -628,9 +630,8 @@ export default function App() {
     }
 
     if (!coords) {
-      addToast('URL de Google Maps inválida o no se pudieron extraer coordenadas.', "error");
-      setIsSaving(false);
-      return;
+      addToast('No se pudieron extraer coordenadas, pero el registro se guardará.', "success");
+      coords = { lat: NaN, lng: NaN };
     }
 
     const finalName = newClientName || autoName || "Cliente sin nombre";
@@ -1193,7 +1194,7 @@ export default function App() {
                         </div>
                         <div className="flex gap-2">
                           <a 
-                            href={`https://www.google.com/maps/dir/?api=1&destination=${client.lat},${client.lng}`}
+                            href={client.address_url || `https://www.google.com/maps/dir/?api=1&destination=${client.lat},${client.lng}`}
                             target="_blank"
                             rel="noopener noreferrer"
                             onClick={(e) => e.stopPropagation()}
@@ -1649,7 +1650,7 @@ export default function App() {
                         whileTap={{ scale: 0.95 }}
                         animate={{ y: [0, -4, 0] }}
                         transition={{ duration: 1.5, repeat: Infinity, ease: "easeInOut" }}
-                        href={`https://www.google.com/maps/dir/?api=1&destination=${selectedClient.lat},${selectedClient.lng}`}
+                        href={selectedClient.address_url || `https://www.google.com/maps/dir/?api=1&destination=${selectedClient.lat},${selectedClient.lng}`}
                         target="_blank"
                         rel="noopener noreferrer"
                         className="flex w-full items-center justify-center gap-2 rounded-xl bg-blue-600 py-3 text-sm font-black text-white shadow-md hover:bg-blue-700 transition-colors"
