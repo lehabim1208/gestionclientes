@@ -7,16 +7,44 @@ export default async function handler(req: any, res: any) {
   if (!url) return res.status(400).json({ error: "URL is required" });
 
   try {
-    // Follow redirects to get the final URL
-    const response = await fetch(url, {
-      method: "GET",
-      redirect: "follow",
-      headers: {
-        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/91.0.4472.124 Safari/537.36"
-      }
-    });
+    let currentUrl = url;
+    let finalUrl = url;
+    let html = "";
+    let redirects = 0;
+    const maxRedirects = 5;
 
-    const finalUrl = response.url;
+    while (redirects < maxRedirects) {
+      const response = await fetch(currentUrl, {
+        method: "GET",
+        redirect: "manual",
+        headers: {
+          "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/91.0.4472.124 Safari/537.36",
+          "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,image/webp,*/*;q=0.8",
+          "Accept-Language": "en-US,en;q=0.5"
+        }
+      });
+
+      if (response.status >= 300 && response.status < 400) {
+        const location = response.headers.get("location");
+        if (location) {
+          const nextUrl = new URL(location, currentUrl).toString();
+          currentUrl = nextUrl;
+          finalUrl = nextUrl;
+          redirects++;
+          
+          // If the new URL already contains coordinates, we can stop here
+          if (/@(-?\d+\.\d+),(-?\d+\.\d+)/.test(finalUrl) || /!3d(-?\d+\.\d+)!4d(-?\d+\.\d+)/.test(finalUrl)) {
+            break;
+          }
+          continue;
+        }
+      }
+
+      // If we reach here, it's not a redirect
+      html = await response.text();
+      finalUrl = response.url || currentUrl;
+      break;
+    }
     
     // Extract coordinates: @lat,lng
     const coordsRegex = /@(-?\d+\.\d+),(-?\d+\.\d+)/;
@@ -48,10 +76,8 @@ export default async function handler(req: any, res: any) {
     if (nameMatch && nameMatch[1]) {
       name = decodeURIComponent(nameMatch[1].replace(/\+/g, " "));
     }
-
-    const html = await response.text();
     
-    if (!name) {
+    if (!name && html) {
       // Try to extract name from title tag
       const titleRegex = /<title>([^<]+) - Google Maps<\/title>/;
       const titleMatch = html.match(titleRegex);
@@ -76,16 +102,18 @@ export default async function handler(req: any, res: any) {
     }
 
     // If no coordinates found in URL, try to look in the HTML (sometimes they are in meta tags)
-    const metaCoordsRegex = /meta content=".*?(-?\d+\.\d+);(-?\d+\.\d+)"/;
-    const metaMatch = html.match(metaCoordsRegex);
-    
-    if (metaMatch && metaMatch[1] && metaMatch[2]) {
-      return res.status(200).json({
-        lat: parseFloat(metaMatch[1]),
-        lng: parseFloat(metaMatch[2]),
-        name,
-        finalUrl
-      });
+    if (html) {
+      const metaCoordsRegex = /meta content=".*?(-?\d+\.\d+);(-?\d+\.\d+)"/;
+      const metaMatch = html.match(metaCoordsRegex);
+      
+      if (metaMatch && metaMatch[1] && metaMatch[2]) {
+        return res.status(200).json({
+          lat: parseFloat(metaMatch[1]),
+          lng: parseFloat(metaMatch[2]),
+          name,
+          finalUrl
+        });
+      }
     }
 
     return res.status(404).json({ error: "Could not extract coordinates from URL", finalUrl });

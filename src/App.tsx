@@ -208,6 +208,7 @@ export default function App() {
   const [verificationToken, setVerificationToken] = useState<string | null>(null);
   const [isVerifying, setIsVerifying] = useState(false);
   const [verificationError, setVerificationError] = useState<string | null>(null);
+  const [passwordError, setPasswordError] = useState<string | null>(null);
   const [newPassword, setNewPassword] = useState('');
   const [confirmPassword, setConfirmPassword] = useState('');
   const [verifiedUser, setVerifiedUser] = useState<AppUser | null>(null);
@@ -987,7 +988,6 @@ export default function App() {
     }
 
     if (!coords) {
-      addToast('No se pudieron extraer coordenadas, pero el registro se guardará.', "success");
       coords = { lat: NaN, lng: NaN };
     }
 
@@ -1222,12 +1222,13 @@ export default function App() {
 
   const handleSetPassword = async (e: React.FormEvent) => {
     e.preventDefault();
+    setPasswordError(null);
     if (newPassword !== confirmPassword) {
-      setVerificationError("Las contraseñas no coinciden.");
+      setPasswordError("Las contraseñas no coinciden.");
       return;
     }
     if (newPassword.length < 6) {
-      setVerificationError("La contraseña debe tener al menos 6 caracteres.");
+      setPasswordError("La contraseña debe tener al menos 6 caracteres.");
       return;
     }
 
@@ -1370,6 +1371,11 @@ export default function App() {
                     </button>
                   </div>
                 </div>
+                {passwordError && (
+                  <div className="rounded-xl bg-red-50 p-3 text-sm text-red-600 ring-1 ring-red-100 dark:bg-red-900/20 dark:ring-red-500/30">
+                    <p className="text-center font-medium">{passwordError}</p>
+                  </div>
+                )}
                 <button
                   type="submit"
                   disabled={isVerifying}
