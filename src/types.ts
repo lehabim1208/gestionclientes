@@ -36,5 +36,10 @@ export interface DecryptedClient {
 export interface AppUser {
   id: string;
   username: string;
+  email?: string;
   role: 'driver' | 'superadmin';
+  is_active?: boolean;
+  is_verified?: boolean;
+  verification_token?: string;
+  token_expires_at?: string;
 }

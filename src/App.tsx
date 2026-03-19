@@ -32,7 +32,8 @@ import {
   Menu,
   Trophy,
   Edit2,
-  RefreshCw
+  RefreshCw,
+  WifiOff
 } from 'lucide-react';
 import { motion, AnimatePresence, LayoutGroup } from 'motion/react';
 import Cookies from 'js-cookie';
@@ -79,6 +80,8 @@ export default function App() {
   const [user, setUser] = useState<AppUser | null>(null);
   const [masterKey, setMasterKey] = useState<string>('');
   const [isAuthLoading, setIsAuthLoading] = useState(true);
+  const [isOffline, setIsOffline] = useState(!navigator.onLine);
+  const [isSyncing, setIsSyncing] = useState(false);
   const [isLoggingIn, setIsLoggingIn] = useState(false);
   const [authError, setAuthError] = useState<string | null>(null);
   const [username, setUsername] = useState('');
@@ -101,6 +104,12 @@ export default function App() {
   const [showPassword, setShowPassword] = useState(false);
   const [showMasterKey, setShowMasterKey] = useState(false);
   const [adminUsers, setAdminUsers] = useState<AppUser[]>([]);
+  const [adminSearchQuery, setAdminSearchQuery] = useState('');
+  const [editingUser, setEditingUser] = useState<AppUser | null>(null);
+  const [editUsername, setEditUsername] = useState('');
+  const [editEmail, setEditEmail] = useState('');
+  const [editPassword, setEditPassword] = useState('');
+  const [isEditingUser, setIsEditingUser] = useState(false);
 
   // Form states for adding client
   const [newClientUrl, setNewClientUrl] = useState('');
@@ -193,6 +202,38 @@ export default function App() {
     return () => mediaQuery.removeEventListener('change', listener);
   }, [themePreference]);
 
+  const [verificationToken, setVerificationToken] = useState<string | null>(null);
+  const [isVerifying, setIsVerifying] = useState(false);
+  const [verificationError, setVerificationError] = useState<string | null>(null);
+  const [newPassword, setNewPassword] = useState('');
+  const [confirmPassword, setConfirmPassword] = useState('');
+  const [verifiedUser, setVerifiedUser] = useState<AppUser | null>(null);
+
+  const checkVerificationToken = async (token: string) => {
+    setIsAuthLoading(true);
+    try {
+      const { data, error } = await supabase
+        .from('app_users')
+        .select('*')
+        .eq('verification_token', token)
+        .single();
+
+      if (error || !data) {
+        setVerificationError("El enlace de verificación es inválido o no existe.");
+      } else if (data.is_verified) {
+        setVerificationError("Esta cuenta ya ha sido verificada. Por favor, inicia sesión.");
+      } else if (data.token_expires_at && new Date(data.token_expires_at) < new Date()) {
+        setVerificationError("El enlace de verificación ha expirado.");
+      } else {
+        setVerifiedUser(data);
+      }
+    } catch (err) {
+      setVerificationError("Error al verificar el enlace.");
+    } finally {
+      setIsAuthLoading(false);
+    }
+  };
+
   useEffect(() => {
     const initAuth = async () => {
       const savedUser = localStorage.getItem('gmx_user');
@@ -202,21 +243,35 @@ export default function App() {
         try {
           const parsedUser = JSON.parse(savedUser);
           
-          // Verificar que el usuario aún exista en la DB para evitar errores de Foreign Key
-          const { data, error } = await supabase
-            .from('app_users')
-            .select('id, username, role')
-            .eq('id', parsedUser.id)
-            .single();
-            
-          if (data && !error) {
-            setUser(data);
-            localStorage.setItem('gmx_user', JSON.stringify(data));
+          if (!navigator.onLine) {
+            // Trust cached user if offline
+            setUser(parsedUser);
             const mk = getMasterKeyFromCookie(savedPass);
             if (mk) setMasterKey(mk);
+            setIsOffline(true);
           } else {
-            // El usuario ya no existe en la DB, limpiar sesión
-            handleLogout();
+            // Verificar que el usuario aún exista en la DB para evitar errores de Foreign Key
+            const { data, error } = await supabase
+              .from('app_users')
+              .select('id, username, email, role, is_active, is_verified')
+              .eq('id', parsedUser.id)
+              .single();
+              
+            if (data && !error && data.is_active !== false) {
+              setUser(data);
+              localStorage.setItem('gmx_user', JSON.stringify(data));
+              const mk = getMasterKeyFromCookie(savedPass);
+              if (mk) setMasterKey(mk);
+            } else if (error && error.message.includes('FetchError')) {
+              // Network error, trust cache
+              setUser(parsedUser);
+              const mk = getMasterKeyFromCookie(savedPass);
+              if (mk) setMasterKey(mk);
+              setIsOffline(true);
+            } else {
+              // El usuario ya no existe o está inactivo
+              handleLogout();
+            }
           }
         } catch (e) {
           handleLogout();
@@ -225,7 +280,14 @@ export default function App() {
       setIsAuthLoading(false);
     };
 
-    initAuth();
+    const urlParams = new URLSearchParams(window.location.search);
+    const token = urlParams.get('verify');
+    if (token) {
+      setVerificationToken(token);
+      checkVerificationToken(token);
+    } else {
+      initAuth();
+    }
 
     // Load persisted form state
     const savedForm = localStorage.getItem('gmx_pending_client');
@@ -254,6 +316,59 @@ export default function App() {
       setAdminNewPassword(form.password || '');
     }
   }, []);
+
+  const syncOfflineData = async () => {
+    if (!masterKey || !user || isSyncing) return;
+    
+    const queueStr = localStorage.getItem('gmx_offline_queue');
+    if (!queueStr) return;
+
+    try {
+      setIsSyncing(true);
+      const queue = JSON.parse(queueStr);
+      if (!Array.isArray(queue) || queue.length === 0) return;
+
+      addToast(`Sincronizando ${queue.length} registros pendientes...`, "info");
+
+      for (const item of queue) {
+        if (item.action === 'insert') {
+          await supabase.from('clients').insert({
+            driver_id: user.id,
+            ...item.data
+          });
+        } else if (item.action === 'update') {
+          await supabase.from('clients').update(item.data).eq('id', item.id);
+        } else if (item.action === 'delete') {
+          await supabase.from('clients').delete().eq('id', item.id);
+        }
+      }
+
+      localStorage.removeItem('gmx_offline_queue');
+      addToast("Sincronización completada con éxito", "success");
+      fetchClients(); // Refresh data from server
+    } catch (err) {
+      console.error("Error syncing offline data:", err);
+      addToast("Error al sincronizar datos. Se reintentará más tarde.", "error");
+    } finally {
+      setIsSyncing(false);
+    }
+  };
+
+  useEffect(() => {
+    const handleOnline = () => {
+      setIsOffline(false);
+      syncOfflineData();
+    };
+    const handleOffline = () => setIsOffline(true);
+
+    window.addEventListener('online', handleOnline);
+    window.addEventListener('offline', handleOffline);
+
+    return () => {
+      window.removeEventListener('online', handleOnline);
+      window.removeEventListener('offline', handleOffline);
+    };
+  }, [masterKey, user, isSyncing]);
 
   // Persist form state on changes
   useEffect(() => {
@@ -303,14 +418,45 @@ export default function App() {
     setIsLoggingIn(true);
     
     try {
+      if (isOffline || !navigator.onLine) {
+        // Try offline login
+        const savedUser = localStorage.getItem('gmx_user');
+        const savedPass = localStorage.getItem('gmx_pass');
+        if (savedUser && savedPass) {
+          const parsedUser = JSON.parse(savedUser);
+          if ((parsedUser.username === username || parsedUser.email === username) && password === savedPass) {
+            setUser(parsedUser);
+            const mk = getMasterKeyFromCookie(savedPass);
+            if (mk) setMasterKey(mk);
+            addToast("Sesión iniciada (Modo sin conexión)", "info");
+            setIsLoggingIn(false);
+            return;
+          }
+        }
+        addToast("No se puede iniciar sesión sin conexión (credenciales no coinciden o no hay caché)", "error");
+        setIsLoggingIn(false);
+        return;
+      }
+
+      // Allow login by email or username
       const { data, error } = await supabase
         .from('app_users')
         .select('*')
-        .eq('username', username)
+        .or(`username.eq.${username},email.eq.${username}`)
         .single();
 
       if (error || !data) {
-        addToast("Usuario no encontrado", "error");
+        addToast("Usuario o correo no encontrado", "error");
+        return;
+      }
+
+      if (data.is_active === false) {
+        addToast("Esta cuenta está desactivada. Contacta al administrador.", "error");
+        return;
+      }
+
+      if (data.is_verified === false) {
+        addToast("Esta cuenta no ha sido verificada. Revisa tu correo.", "error");
         return;
       }
 
@@ -318,7 +464,7 @@ export default function App() {
       const dbPass = data.encrypted_password;
 
       // Try to decrypt if it looks like encrypted data (starts with U2FsdGVkX1)
-      if (dbPass.startsWith('U2FsdGVkX1')) {
+      if (dbPass && dbPass.startsWith('U2FsdGVkX1')) {
         try {
           const bytes = CryptoJS.AES.decrypt(dbPass, SYSTEM_AUTH_SECRET);
           const decrypted = bytes.toString(CryptoJS.enc.Utf8);
@@ -335,7 +481,10 @@ export default function App() {
         const userData: AppUser = {
           id: data.id,
           username: data.username,
-          role: data.role as 'driver' | 'superadmin'
+          email: data.email,
+          role: data.role as 'driver' | 'superadmin',
+          is_active: data.is_active,
+          is_verified: data.is_verified
         };
         setUser(userData);
         localStorage.setItem('gmx_user', JSON.stringify(userData));
@@ -401,6 +550,10 @@ export default function App() {
     }
 
     try {
+      if (isOffline || !navigator.onLine) {
+        throw new Error("Sin conexión");
+      }
+
       const { data, error } = await supabase
         .from('clients')
         .select('*, app_users(username)')
@@ -416,14 +569,23 @@ export default function App() {
       }
     } catch (err) {
       console.error('Error fetching clients:', err);
-      addToast("Error al cargar clientes", "error");
+      // Fallback to cache on error
+      const cached = loadClientsFromCache(currentKey);
+      if (cached) {
+        setClients(cached);
+        if (force) {
+          addToast("Mostrando datos en caché (Sin conexión)", "info");
+        }
+      } else {
+        addToast("Error al cargar clientes", "error");
+      }
     }
   };
 
   const fetchAdminUsers = async () => {
     if (user?.role !== 'superadmin') return;
     try {
-      const { data, error } = await supabase.from('app_users').select('id, username, role');
+      const { data, error } = await supabase.from('app_users').select('id, username, email, role, is_active, is_verified, verification_token');
       if (error) throw error;
       if (data) setAdminUsers(data as AppUser[]);
     } catch (err: any) {
@@ -481,6 +643,19 @@ export default function App() {
       setDecryptedClients([]);
     }
   }, [clients, masterKey, userLocation]);
+
+  const filteredAndSortedAdminUsers = useMemo(() => {
+    return adminUsers
+      .filter(u => 
+        u.username.toLowerCase().includes(adminSearchQuery.toLowerCase()) || 
+        (u.email && u.email.toLowerCase().includes(adminSearchQuery.toLowerCase()))
+      )
+      .sort((a, b) => {
+        if (a.role === 'superadmin' && b.role !== 'superadmin') return -1;
+        if (a.role !== 'superadmin' && b.role === 'superadmin') return 1;
+        return a.username.localeCompare(b.username);
+      });
+  }, [adminUsers, adminSearchQuery]);
 
   const filteredClients = useMemo(() => {
     if (!searchQuery.trim()) return [];
@@ -541,20 +716,61 @@ export default function App() {
   const handleAdminCreateUser = async (e: React.FormEvent) => {
     e.preventDefault();
     if (user?.role !== 'superadmin') return;
+    if (isOffline) {
+      addToast("No se puede invitar usuarios sin conexión", "error");
+      return;
+    }
     setIsAdminCreating(true);
 
     try {
-      // Encrypt the password before saving to DB
-      const encryptedPass = CryptoJS.AES.encrypt(adminNewPassword, SYSTEM_AUTH_SECRET).toString();
+      // Generate a random verification token
+      const token = Array.from(crypto.getRandomValues(new Uint8Array(32)))
+        .map(b => b.toString(16).padStart(2, '0'))
+        .join('');
+      
+      // Token expires in 24 hours
+      const expiresAt = new Date();
+      expiresAt.setHours(expiresAt.getHours() + 24);
 
-      const { error } = await supabase.from('app_users').insert([{
-        username: adminNewEmail,
-        encrypted_password: encryptedPass,
-        role: 'driver'
-      }]);
+      // Create user with email and token, inactive and unverified by default
+      // We don't need a password yet, but we can set a dummy one or leave it null if DB allows
+      // Assuming DB requires encrypted_password, we set a dummy one
+      const dummyPass = CryptoJS.AES.encrypt(token, SYSTEM_AUTH_SECRET).toString();
+
+      const { data, error } = await supabase.from('app_users').insert([{
+        username: adminNewEmail.split('@')[0], // Default username from email
+        email: adminNewEmail,
+        encrypted_password: dummyPass,
+        role: 'driver',
+        is_active: true, // Active but not verified
+        is_verified: false,
+        verification_token: token,
+        token_expires_at: expiresAt.toISOString()
+      }]).select().single();
 
       if (error) throw error;
-      addToast("Conductor creado exitosamente", "success");
+
+      const verificationLink = `https://guiamx.vercel.app/?verify=${token}`;
+
+      // Try to send email
+      try {
+        const response = await fetch('/api/send-invite', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ email: adminNewEmail, link: verificationLink })
+        });
+        const result = await response.json();
+        
+        if (result.success) {
+          addToast("Conductor invitado exitosamente. Se ha enviado un correo.", "success");
+        } else {
+          addToast("Usuario creado, pero hubo un error al enviar el correo.", "error");
+        }
+      } catch (emailErr) {
+        console.error("Error calling send-invite:", emailErr);
+        addToast("Usuario creado. Configura SMTP para enviar correos.", "info");
+      }
+
       setAdminNewEmail('');
       setAdminNewPassword('');
       localStorage.removeItem('gmx_pending_admin');
@@ -563,6 +779,88 @@ export default function App() {
       addToast(err.message, "error");
     } finally {
       setIsAdminCreating(false);
+    }
+  };
+
+  const handleAdminEditUser = async (e: React.FormEvent) => {
+    e.preventDefault();
+    if (user?.role !== 'superadmin' || !editingUser) return;
+    if (isOffline) {
+      addToast("No se puede editar usuarios sin conexión", "error");
+      return;
+    }
+    setIsEditingUser(true);
+
+    try {
+      const updates: any = {};
+      if (editUsername !== editingUser.username) updates.username = editUsername;
+      if (editEmail !== editingUser.email) updates.email = editEmail;
+      
+      if (editPassword) {
+        updates.encrypted_password = CryptoJS.AES.encrypt(editPassword, SYSTEM_AUTH_SECRET).toString();
+      }
+
+      if (Object.keys(updates).length === 0) {
+        addToast("No hay cambios para guardar", "info");
+        setEditingUser(null);
+        return;
+      }
+
+      const { error } = await supabase
+        .from('app_users')
+        .update(updates)
+        .eq('id', editingUser.id);
+
+      if (error) throw error;
+
+      addToast("Usuario actualizado correctamente", "success");
+      setEditingUser(null);
+      setEditPassword('');
+      fetchAdminUsers();
+    } catch (err: any) {
+      addToast(err.message || "Error al actualizar usuario", "error");
+    } finally {
+      setIsEditingUser(false);
+    }
+  };
+
+  const handleToggleUserStatus = async (id: string, currentStatus: boolean) => {
+    if (user?.role !== 'superadmin') return;
+    if (isOffline) {
+      addToast("No se puede cambiar el estado de usuario sin conexión", "error");
+      return;
+    }
+    try {
+      const { error } = await supabase.from('app_users').update({ is_active: !currentStatus }).eq('id', id);
+      if (error) throw error;
+      addToast(`Usuario ${!currentStatus ? 'activado' : 'desactivado'}`, "success");
+      fetchAdminUsers();
+    } catch (err: any) {
+      addToast(err.message || "Error al cambiar estado", "error");
+    }
+  };
+
+  const handleResendInvite = async (email: string, token: string) => {
+    if (user?.role !== 'superadmin') return;
+    if (isOffline) {
+      addToast("No se puede reenviar invitación sin conexión", "error");
+      return;
+    }
+    const verificationLink = `https://guiamx.vercel.app/?verify=${token}`;
+    try {
+      const response = await fetch('/api/send-invite', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ email, link: verificationLink })
+      });
+      const result = await response.json();
+      if (result.success) {
+        addToast("Invitación reenviada exitosamente", "success");
+      } else {
+        addToast("Error al enviar el correo", "error");
+      }
+    } catch (err) {
+      addToast("Error de conexión al enviar correo", "error");
     }
   };
 
@@ -583,16 +881,39 @@ export default function App() {
     if (user?.role !== 'superadmin') return;
     setIsDeletingClient(true);
     try {
-      const { error } = await supabase.from('clients').delete().eq('id', id);
-      if (error) throw error;
-      
-      setClients(prev => {
-        const updated = prev.filter(c => c.id !== id);
-        saveClientsToCache(updated, masterKey!);
-        return updated;
-      });
+      if (isOffline) {
+        const queueStr = localStorage.getItem('gmx_offline_queue');
+        let queue = queueStr ? JSON.parse(queueStr) : [];
+        
+        if (id.startsWith('temp_')) {
+          // If it's a temp record, just remove it from the queue
+          queue = queue.filter((item: any) => item.id !== id);
+        } else {
+          // Otherwise add a delete action
+          queue.push({ action: 'delete', id });
+        }
+        
+        localStorage.setItem('gmx_offline_queue', JSON.stringify(queue));
+        
+        setClients(prev => {
+          const updated = prev.filter(c => c.id !== id);
+          saveClientsToCache(updated, masterKey!);
+          return updated;
+        });
 
-      addToast("Cliente eliminado permanentemente", "success");
+        addToast("Cliente eliminado localmente (Sin conexión)", "info");
+      } else {
+        const { error } = await supabase.from('clients').delete().eq('id', id);
+        if (error) throw error;
+        
+        setClients(prev => {
+          const updated = prev.filter(c => c.id !== id);
+          saveClientsToCache(updated, masterKey!);
+          return updated;
+        });
+
+        addToast("Cliente eliminado permanentemente", "success");
+      }
       setClientToDelete(null);
       setSelectedClient(null);
     } catch (err: any) {
@@ -652,45 +973,95 @@ export default function App() {
         references_text: encrypt(newClientReferences, masterKey),
       };
 
-      let error, newClientData;
-      if (editingClient) {
-        const { data, error: updateError } = await supabase
-          .from('clients')
-          .update(clientData)
-          .eq('id', editingClient.id)
-          .select('*, app_users(username)')
-          .single();
-        error = updateError;
-        newClientData = data;
-      } else {
-        const { data, error: insertError } = await supabase
-          .from('clients')
-          .insert({
-            driver_id: user.id,
-            ...clientData
-          })
-          .select('*, app_users(username)')
-          .single();
-        error = insertError;
-        newClientData = data;
-      }
+      if (isOffline) {
+        // Save to offline queue
+        const queueStr = localStorage.getItem('gmx_offline_queue');
+        let queue = queueStr ? JSON.parse(queueStr) : [];
+        
+        const offlineId = editingClient ? editingClient.id : `temp_${Date.now()}`;
+        
+        if (editingClient && offlineId.startsWith('temp_')) {
+          // If editing a temp record, just update its data in the queue
+          const existingIndex = queue.findIndex((item: any) => item.id === offlineId && item.action === 'insert');
+          if (existingIndex !== -1) {
+            queue[existingIndex].data = { ...queue[existingIndex].data, ...clientData };
+          } else {
+            // Fallback if not found
+            queue.push({ action: 'insert', id: offlineId, data: clientData });
+          }
+        } else {
+          queue.push({
+            action: editingClient ? 'update' : 'insert',
+            id: offlineId,
+            data: clientData
+          });
+        }
+        
+        localStorage.setItem('gmx_offline_queue', JSON.stringify(queue));
 
-      if (error) throw error;
+        // Update local state optimistically
+        const newClientData = {
+          id: offlineId,
+          driver_id: user.id,
+          created_at: new Date().toISOString(),
+          app_users: { username: user.username },
+          ...clientData
+        };
 
-      if (newClientData) {
         setClients(prev => {
           let updated;
           if (editingClient) {
-            updated = prev.map(c => c.id === newClientData.id ? newClientData : c);
+            updated = prev.map(c => c.id === editingClient.id ? newClientData as any : c);
           } else {
-            updated = [newClientData, ...prev];
+            updated = [newClientData as any, ...prev];
           }
           saveClientsToCache(updated, masterKey);
           return updated;
         });
+
+        addToast(editingClient ? "Cliente actualizado localmente (Sin conexión)" : "Cliente guardado localmente (Sin conexión)", "info");
+      } else {
+        let error, newClientData;
+        if (editingClient) {
+          const { data, error: updateError } = await supabase
+            .from('clients')
+            .update(clientData)
+            .eq('id', editingClient.id)
+            .select('*, app_users(username)')
+            .single();
+          error = updateError;
+          newClientData = data;
+        } else {
+          const { data, error: insertError } = await supabase
+            .from('clients')
+            .insert({
+              driver_id: user.id,
+              ...clientData
+            })
+            .select('*, app_users(username)')
+            .single();
+          error = insertError;
+          newClientData = data;
+        }
+
+        if (error) throw error;
+
+        if (newClientData) {
+          setClients(prev => {
+            let updated;
+            if (editingClient) {
+              updated = prev.map(c => c.id === newClientData.id ? newClientData : c);
+            } else {
+              updated = [newClientData, ...prev];
+            }
+            saveClientsToCache(updated, masterKey);
+            return updated;
+          });
+        }
+
+        addToast(editingClient ? "Cliente actualizado correctamente" : "Cliente registrado correctamente", "success");
       }
 
-      addToast(editingClient ? "Cliente actualizado correctamente" : "Cliente registrado correctamente", "success");
       setIsAdding(false);
       setEditingClient(null);
       setNewClientUrl('');
@@ -813,6 +1184,115 @@ export default function App() {
     </div>
   );
 
+  const handleSetPassword = async (e: React.FormEvent) => {
+    e.preventDefault();
+    if (newPassword !== confirmPassword) {
+      setVerificationError("Las contraseñas no coinciden.");
+      return;
+    }
+    if (newPassword.length < 6) {
+      setVerificationError("La contraseña debe tener al menos 6 caracteres.");
+      return;
+    }
+
+    setIsVerifying(true);
+    try {
+      const encryptedPass = CryptoJS.AES.encrypt(newPassword, SYSTEM_AUTH_SECRET).toString();
+      
+      const { error } = await supabase
+        .from('app_users')
+        .update({
+          encrypted_password: encryptedPass,
+          is_verified: true,
+          verification_token: null,
+          token_expires_at: null
+        })
+        .eq('id', verifiedUser?.id);
+
+      if (error) throw error;
+      
+      addToast("Cuenta verificada y contraseña establecida. Ahora puedes iniciar sesión.", "success");
+      setVerificationToken(null);
+      setVerifiedUser(null);
+      // Remove token from URL
+      window.history.replaceState({}, document.title, window.location.pathname);
+    } catch (err) {
+      setVerificationError("Error al establecer la contraseña.");
+    } finally {
+      setIsVerifying(false);
+    }
+  };
+
+  if (verificationToken) {
+    return (
+      <div className="flex min-h-screen flex-col items-center justify-center bg-gray-50 p-6 dark:bg-gray-900">
+        <div className="w-full max-w-md rounded-3xl bg-white p-8 shadow-xl ring-1 ring-gray-200 dark:bg-gray-800 dark:ring-gray-700">
+          <div className="mb-8 flex justify-center">
+            <div className="rounded-2xl bg-blue-600 p-4 shadow-lg">
+              <Navigation className="h-10 w-10 text-white" />
+            </div>
+          </div>
+          <h1 className="mb-2 text-center text-2xl font-bold text-gray-900 dark:text-white">Verificación de Cuenta</h1>
+          
+          {verificationError ? (
+            <div className="text-center">
+              <div className="rounded-2xl bg-red-50 p-4 text-red-600 ring-1 ring-red-100 dark:bg-red-900/20 dark:ring-red-500/30">
+                <p className="font-medium">{verificationError}</p>
+              </div>
+              <button 
+                onClick={() => {
+                  setVerificationToken(null);
+                  window.history.replaceState({}, document.title, window.location.pathname);
+                }}
+                className="mt-6 w-full rounded-xl bg-gray-100 py-3 font-bold text-gray-700 hover:bg-gray-200 dark:bg-gray-700 dark:text-gray-300 dark:hover:bg-gray-600"
+              >
+                Volver al inicio de sesión
+              </button>
+            </div>
+          ) : verifiedUser ? (
+            <form onSubmit={handleSetPassword} className="space-y-6">
+              <p className="text-center text-gray-600 dark:text-gray-400">
+                Hola <strong>{verifiedUser.email}</strong>, establece tu contraseña para activar tu cuenta.
+              </p>
+              <div>
+                <label className="mb-2 block text-sm font-medium text-gray-700 dark:text-gray-300">Nueva Contraseña</label>
+                <input
+                  type="password"
+                  value={newPassword}
+                  onChange={(e) => setNewPassword(e.target.value)}
+                  className="w-full rounded-xl border-0 bg-gray-50 px-4 py-3 text-gray-900 ring-1 ring-inset ring-gray-300 focus:ring-2 focus:ring-inset focus:ring-blue-600 dark:bg-gray-900 dark:text-white dark:ring-gray-700"
+                  required
+                />
+              </div>
+              <div>
+                <label className="mb-2 block text-sm font-medium text-gray-700 dark:text-gray-300">Confirmar Contraseña</label>
+                <input
+                  type="password"
+                  value={confirmPassword}
+                  onChange={(e) => setConfirmPassword(e.target.value)}
+                  className="w-full rounded-xl border-0 bg-gray-50 px-4 py-3 text-gray-900 ring-1 ring-inset ring-gray-300 focus:ring-2 focus:ring-inset focus:ring-blue-600 dark:bg-gray-900 dark:text-white dark:ring-gray-700"
+                  required
+                />
+              </div>
+              <button
+                type="submit"
+                disabled={isVerifying}
+                className="w-full rounded-xl bg-blue-600 py-3 font-bold text-white shadow-lg shadow-blue-600/20 transition-all hover:bg-blue-700 active:scale-[0.98] disabled:opacity-70"
+              >
+                {isVerifying ? 'Guardando...' : 'Establecer Contraseña'}
+              </button>
+            </form>
+          ) : (
+            <div className="flex justify-center py-8">
+              <Loader2 className="h-8 w-8 animate-spin text-blue-600" />
+            </div>
+          )}
+        </div>
+        {renderToasts()}
+      </div>
+    );
+  }
+
   if (!user) {
     return (
       <div className="flex min-h-screen flex-col items-center justify-center bg-slate-50 dark:bg-slate-950 p-6 transition-colors duration-300">
@@ -844,7 +1324,7 @@ export default function App() {
                   autoCapitalize="none"
                   autoCorrect="off"
                   className="block w-full rounded-2xl border-0 py-4 pl-12 text-slate-900 dark:text-white bg-white dark:bg-slate-800 ring-1 ring-inset ring-slate-200 dark:ring-slate-700 placeholder:text-slate-400 focus:ring-2 focus:ring-walmart-blue transition-all"
-                  placeholder="Usuario"
+                  placeholder="Usuario o correo"
                   value={username}
                   onChange={(e) => setUsername(e.target.value)}
                 />
@@ -976,7 +1456,15 @@ export default function App() {
           <div className="flex h-10 w-10 items-center justify-center rounded-full bg-white text-walmart-blue shadow-sm">
             <Navigation className="h-6 w-6" />
           </div>
-          <h1 className="text-2xl font-black tracking-tight text-white">GuíaMX</h1>
+          <h1 className="text-2xl font-black tracking-tight text-white flex items-center gap-2">
+            GuíaMX
+            {isOffline && (
+              <span className="inline-flex items-center gap-1 rounded-full bg-red-500/20 px-2 py-0.5 text-xs font-bold text-red-100 ring-1 ring-red-500/50">
+                <WifiOff className="h-3 w-3" />
+                Sin conexión
+              </span>
+            )}
+          </h1>
         </div>
         <div className="flex items-center gap-1 relative">
           {deferredPrompt && (
@@ -1269,33 +1757,23 @@ export default function App() {
                   <form onSubmit={handleAdminCreateUser} className="space-y-4">
                     <div className="space-y-3">
                       <div>
-                        <label className="block text-[10px] font-black uppercase tracking-wider text-slate-400 mb-1">Usuario</label>
+                        <label className="block text-[10px] font-black uppercase tracking-wider text-slate-400 mb-1">Correo Electrónico</label>
                         <input
-                          type="text"
+                          type="email"
                           required
                           className="w-full rounded-xl border-0 py-2.5 bg-white dark:bg-slate-800 text-slate-900 dark:text-white ring-1 ring-inset ring-slate-200 dark:ring-slate-700 focus:ring-2 focus:ring-walmart-blue transition-all text-sm"
-                          placeholder="ej: driver123"
+                          placeholder="ej: conductor@empresa.com"
                           value={adminNewEmail}
                           onChange={(e) => setAdminNewEmail(e.target.value)}
-                        />
-                      </div>
-                      <div>
-                        <label className="block text-[10px] font-black uppercase tracking-wider text-slate-400 mb-1">Contraseña</label>
-                        <input
-                          type="password"
-                          required
-                          className="w-full rounded-xl border-0 py-2.5 bg-white dark:bg-slate-800 text-slate-900 dark:text-white ring-1 ring-inset ring-slate-200 dark:ring-slate-700 focus:ring-2 focus:ring-walmart-blue transition-all text-sm"
-                          value={adminNewPassword}
-                          onChange={(e) => setAdminNewPassword(e.target.value)}
                         />
                       </div>
                     </div>
                     <button
                       disabled={isAdminCreating}
                       type="submit"
-                      className="w-full rounded-xl bg-walmart-blue py-3 font-bold text-white shadow-lg hover:bg-blue-700 active:scale-[0.98] transition-all disabled:opacity-50 text-sm"
+                      className="w-full rounded-xl bg-walmart-blue py-3 font-bold text-white shadow-lg hover:bg-blue-700 active:scale-[0.98] transition-all disabled:opacity-50 text-sm flex items-center justify-center gap-2"
                     >
-                      {isAdminCreating ? <Loader2 className="h-4 w-4 animate-spin mx-auto" /> : 'CREAR CONDUCTOR'}
+                      {isAdminCreating ? <Loader2 className="h-4 w-4 animate-spin mx-auto" /> : <><Plus className="h-4 w-4" /> INVITAR CONDUCTOR</>}
                     </button>
                   </form>
                 </div>
@@ -1315,25 +1793,100 @@ export default function App() {
                   </p>
                 </div>
 
-                <div className="rounded-3xl bg-white dark:bg-slate-900 p-6 shadow-xl ring-1 ring-slate-100 dark:ring-slate-800">
-                  <h3 className="text-lg font-black text-slate-900 dark:text-white mb-4">Conductores Activos</h3>
-                  <div className="space-y-2 max-h-64 overflow-y-auto pr-2">
-                    {adminUsers.map(u => (
-                      <div key={u.id} className="flex items-center justify-between p-3 rounded-xl bg-slate-50 dark:bg-slate-800/50 ring-1 ring-slate-100 dark:ring-slate-800">
-                        <div>
-                          <p className="text-sm font-bold text-slate-900 dark:text-white">{u.username}</p>
-                          <p className="text-[10px] font-black uppercase text-slate-400 dark:text-slate-500">{u.role}</p>
+                <div className="rounded-3xl bg-white dark:bg-slate-900 p-6 shadow-xl ring-1 ring-slate-100 dark:ring-slate-800 md:col-span-2">
+                  <div className="flex items-center justify-between mb-6">
+                    <h3 className="text-lg font-black text-slate-900 dark:text-white">Conductores Registrados</h3>
+                    <span className="rounded-full bg-blue-100 dark:bg-blue-900/30 px-3 py-1 text-xs font-bold text-walmart-blue dark:text-blue-400">
+                      {adminUsers.length} Total
+                    </span>
+                  </div>
+
+                  <div className="mb-4 relative flex items-center rounded-xl bg-slate-50 dark:bg-slate-800/50 px-3 py-2 ring-1 ring-slate-200 dark:ring-slate-700 focus-within:ring-2 focus-within:ring-walmart-blue transition-all">
+                    <Search className="h-4 w-4 text-slate-400 mr-2" />
+                    <input
+                      type="text"
+                      placeholder="Buscar conductor..."
+                      className="flex-1 border-0 bg-transparent p-0 text-sm text-slate-900 dark:text-white focus:ring-0 placeholder:text-slate-400"
+                      value={adminSearchQuery}
+                      onChange={(e) => setAdminSearchQuery(e.target.value)}
+                    />
+                    {adminSearchQuery && (
+                      <button onClick={() => setAdminSearchQuery('')} className="ml-2 text-slate-400 hover:text-slate-600 dark:hover:text-slate-200">
+                        <X className="h-4 w-4" />
+                      </button>
+                    )}
+                  </div>
+
+                  <div className="space-y-3 max-h-96 overflow-y-auto pr-2">
+                    {filteredAndSortedAdminUsers.map(u => (
+                      <div key={u.id} className="flex flex-col sm:flex-row sm:items-center justify-between gap-4 p-4 rounded-2xl bg-slate-50 dark:bg-slate-800/50 ring-1 ring-slate-100 dark:ring-slate-800 transition-all hover:ring-blue-200 dark:hover:ring-blue-800/50">
+                        <div className="flex items-center gap-3">
+                          <div className={`flex h-10 w-10 shrink-0 items-center justify-center rounded-full ${u.role === 'superadmin' ? 'bg-purple-100 text-purple-600 dark:bg-purple-900/30 dark:text-purple-400' : 'bg-blue-100 text-walmart-blue dark:bg-blue-900/30 dark:text-blue-400'}`}>
+                            {u.role === 'superadmin' ? <ShieldCheck className="h-5 w-5" /> : <User className="h-5 w-5" />}
+                          </div>
+                          <div>
+                            <div className="flex items-center gap-2">
+                              <p className="text-sm font-bold text-slate-900 dark:text-white">{u.username}</p>
+                              {u.role === 'superadmin' && (
+                                <span className="rounded bg-purple-100 dark:bg-purple-900/30 px-1.5 py-0.5 text-[10px] font-black uppercase tracking-wider text-purple-600 dark:text-purple-400">Admin</span>
+                              )}
+                              {!u.is_active && (
+                                <span className="rounded bg-red-100 dark:bg-red-900/30 px-1.5 py-0.5 text-[10px] font-black uppercase tracking-wider text-red-600 dark:text-red-400">Inactivo</span>
+                              )}
+                            </div>
+                            <p className="text-xs text-slate-500 dark:text-slate-400">{u.email || 'Sin correo'}</p>
+                            <div className="mt-1 flex items-center gap-2">
+                              <span className={`text-[10px] font-bold uppercase tracking-wider ${u.is_verified ? 'text-emerald-600 dark:text-emerald-400' : 'text-amber-600 dark:text-amber-400'}`}>
+                                {u.is_verified ? '✓ Verificado' : '⏳ Pendiente'}
+                              </span>
+                              {!u.is_verified && u.verification_token && (
+                                <button 
+                                  onClick={() => handleResendInvite(u.email || '', u.verification_token || '')}
+                                  className="text-[10px] font-bold text-blue-600 hover:underline dark:text-blue-400"
+                                >
+                                  Reenviar Invitación
+                                </button>
+                              )}
+                            </div>
+                          </div>
                         </div>
-                        {u.role !== 'superadmin' && (
-                          <button 
-                            onClick={() => handleDeleteUser(u.id)}
-                            className="p-2 text-red-400 hover:text-red-600 hover:bg-red-50 dark:hover:bg-red-900/20 rounded-lg transition-all"
+                        <div className="flex items-center gap-2 sm:ml-auto">
+                          <button
+                            onClick={() => {
+                              setEditingUser(u);
+                              setEditUsername(u.username);
+                              setEditEmail(u.email || '');
+                              setEditPassword('');
+                            }}
+                            className="p-2 text-blue-400 hover:text-blue-600 hover:bg-blue-50 dark:hover:bg-blue-900/20 rounded-lg transition-all"
+                            title="Editar usuario"
                           >
-                            <Trash2 className="h-4 w-4" />
+                            <Edit2 className="h-4 w-4" />
                           </button>
-                        )}
+                          {u.id !== user?.id && (
+                            <>
+                              <button
+                                onClick={() => handleToggleUserStatus(u.id, u.is_active ?? true)}
+                                className={`flex items-center gap-1 rounded-xl px-3 py-2 text-xs font-bold transition-colors ${u.is_active ? 'bg-amber-100 text-amber-700 hover:bg-amber-200 dark:bg-amber-900/30 dark:text-amber-400 dark:hover:bg-amber-900/50' : 'bg-emerald-100 text-emerald-700 hover:bg-emerald-200 dark:bg-emerald-900/30 dark:text-emerald-400 dark:hover:bg-emerald-900/50'}`}
+                              >
+                                {u.is_active ? 'Desactivar' : 'Activar'}
+                              </button>
+                              <button 
+                                onClick={() => handleDeleteUser(u.id)}
+                                className="p-2 text-red-400 hover:text-red-600 hover:bg-red-50 dark:hover:bg-red-900/20 rounded-lg transition-all"
+                              >
+                                <Trash2 className="h-4 w-4" />
+                              </button>
+                            </>
+                          )}
+                        </div>
                       </div>
                     ))}
+                    {adminUsers.length === 0 && (
+                      <div className="rounded-2xl border border-dashed border-slate-200 dark:border-slate-700 p-8 text-center text-slate-500 dark:text-slate-400">
+                        No hay usuarios registrados
+                      </div>
+                    )}
                   </div>
                 </div>
               </div>
@@ -1972,6 +2525,88 @@ ${selectedClient.delivery_notes || 'No especificadas'}
                   {isSaving ? <Loader2 className="h-5 w-5 animate-spin" /> : (editingClient ? <Edit2 className="h-5 w-5" /> : <Plus className="h-5 w-5" />)}
                   {editingClient ? 'ACTUALIZAR REGISTRO' : 'GUARDAR REGISTRO'}
                 </button>
+              </form>
+            </motion.div>
+          </motion.div>
+        )}
+      </AnimatePresence>
+
+      {/* Edit User Modal */}
+      <AnimatePresence>
+        {isEditingUser && editingUser && (
+          <motion.div 
+            initial={{ opacity: 0 }}
+            animate={{ opacity: 1 }}
+            exit={{ opacity: 0 }}
+            className="fixed inset-0 z-50 flex items-center justify-center bg-slate-900/40 backdrop-blur-sm p-4"
+          >
+            <motion.div 
+              initial={{ scale: 0.95, opacity: 0, y: 20 }}
+              animate={{ scale: 1, opacity: 1, y: 0 }}
+              exit={{ scale: 0.95, opacity: 0, y: 20 }}
+              className="w-full max-w-md rounded-3xl bg-white dark:bg-slate-900 p-6 shadow-2xl"
+            >
+              <div className="mb-6 flex items-center justify-between">
+                <div>
+                  <h2 className="text-xl font-black text-slate-900 dark:text-white">Editar Usuario</h2>
+                  <p className="text-xs font-medium text-slate-500 dark:text-slate-400">Modifica la información del conductor</p>
+                </div>
+                <button 
+                  onClick={() => { setIsEditingUser(false); setEditingUser(null); }} 
+                  className="rounded-full bg-slate-100 dark:bg-slate-800 p-2 hover:bg-slate-200 dark:hover:bg-slate-700 transition-colors"
+                >
+                  <X className="h-5 w-5 text-slate-500 dark:text-slate-400" />
+                </button>
+              </div>
+
+              <form onSubmit={handleAdminEditUser} className="space-y-4">
+                <div className="space-y-3">
+                  <div>
+                    <label className="block text-[10px] font-black uppercase tracking-wider text-slate-400 mb-1">Nombre de Usuario</label>
+                    <input
+                      type="text"
+                      required
+                      className="block w-full rounded-xl border-0 py-3 px-4 text-slate-900 dark:text-white bg-slate-50 dark:bg-slate-800 ring-1 ring-inset ring-slate-200 dark:ring-slate-700 focus:ring-2 focus:ring-walmart-blue transition-all"
+                      value={editUsername}
+                      onChange={(e) => setEditUsername(e.target.value)}
+                    />
+                  </div>
+                  <div>
+                    <label className="block text-[10px] font-black uppercase tracking-wider text-slate-400 mb-1">Correo Electrónico</label>
+                    <input
+                      type="email"
+                      className="block w-full rounded-xl border-0 py-3 px-4 text-slate-900 dark:text-white bg-slate-50 dark:bg-slate-800 ring-1 ring-inset ring-slate-200 dark:ring-slate-700 focus:ring-2 focus:ring-walmart-blue transition-all"
+                      value={editEmail}
+                      onChange={(e) => setEditEmail(e.target.value)}
+                    />
+                  </div>
+                  <div>
+                    <label className="block text-[10px] font-black uppercase tracking-wider text-slate-400 mb-1">Nueva Contraseña (Opcional)</label>
+                    <input
+                      type="password"
+                      placeholder="Dejar en blanco para no cambiar"
+                      className="block w-full rounded-xl border-0 py-3 px-4 text-slate-900 dark:text-white bg-slate-50 dark:bg-slate-800 ring-1 ring-inset ring-slate-200 dark:ring-slate-700 focus:ring-2 focus:ring-walmart-blue transition-all"
+                      value={editPassword}
+                      onChange={(e) => setEditPassword(e.target.value)}
+                    />
+                  </div>
+                </div>
+
+                <div className="pt-4 flex gap-3">
+                  <button
+                    type="button"
+                    onClick={() => { setIsEditingUser(false); setEditingUser(null); }}
+                    className="flex-1 rounded-xl bg-slate-100 dark:bg-slate-800 px-4 py-3 text-sm font-bold text-slate-700 dark:text-slate-300 hover:bg-slate-200 dark:hover:bg-slate-700 transition-colors"
+                  >
+                    Cancelar
+                  </button>
+                  <button
+                    type="submit"
+                    className="flex-1 rounded-xl bg-walmart-blue px-4 py-3 text-sm font-bold text-white hover:bg-blue-700 transition-colors"
+                  >
+                    Guardar Cambios
+                  </button>
+                </div>
               </form>
             </motion.div>
           </motion.div>
