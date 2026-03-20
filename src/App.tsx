@@ -33,13 +33,15 @@ import {
   Trophy,
   Edit2,
   RefreshCw,
-  WifiOff
+  WifiOff,
+  MessageCircle,
+  HelpCircle
 } from 'lucide-react';
 import { motion, AnimatePresence, LayoutGroup } from 'motion/react';
 import Cookies from 'js-cookie';
 import CryptoJS from 'crypto-js';
 import { supabase } from './lib/supabase';
-import { encrypt, decrypt, extractCoordsFromUrl, extractAddressFromUrl, getDistance } from './lib/utils';
+import { encrypt, decrypt, extractCoordsFromUrl, extractAddressFromUrl, getDistance, getWhatsAppUrl } from './lib/utils';
 import type { Client, DecryptedClient, AppUser } from './types';
 
 const formatPhone = (phone: string) => {
@@ -681,15 +683,27 @@ export default function App() {
   const filteredClients = useMemo(() => {
     if (!searchQuery.trim()) return [];
     
-    const normalizeText = (text: string) => 
-      text.toLowerCase().normalize("NFD").replace(/[\u0300-\u036f]/g, "");
+    const normalizeText = (text: string | null | undefined) => 
+      text ? text.toLowerCase().normalize("NFD").replace(/[\u0300-\u036f]/g, "") : "";
       
     const query = normalizeText(searchQuery);
+    const queryPhone = searchQuery.replace(/\D/g, '');
+    
+    const matchPhone = (target: string | null | undefined) => {
+      if (!queryPhone) return false;
+      const t = target ? target.replace(/\D/g, '') : '';
+      if (!t) return false;
+      if (t.includes(queryPhone)) return true;
+      if (queryPhone.length >= 10 && t.length >= 10 && t.slice(-10) === queryPhone.slice(-10)) return true;
+      return false;
+    };
     
     return decryptedClients.filter(c => 
       normalizeText(c.name).includes(query) ||
-      c.phone.includes(searchQuery) ||
-      (c.additional_phones && c.additional_phones.includes(searchQuery))
+      normalizeText(c.address).includes(query) ||
+      normalizeText(c.references_text).includes(query) ||
+      matchPhone(c.phone) ||
+      (c.additional_phones && matchPhone(c.additional_phones))
     ).sort((a, b) => (a.distance ?? Infinity) - (b.distance ?? Infinity));
   }, [decryptedClients, searchQuery]);
 
@@ -1690,16 +1704,6 @@ export default function App() {
                     </button>
                     <button
                       onClick={() => {
-                        fetchClients(true);
-                        setIsMenuOpen(false);
-                      }}
-                      className="flex w-full items-center gap-3 rounded-xl px-3 py-2.5 text-sm font-bold transition-colors text-slate-700 hover:bg-slate-50 dark:text-slate-300 dark:hover:bg-slate-800"
-                    >
-                      <RefreshCw className="h-4 w-4" />
-                      Sincronizar Datos
-                    </button>
-                    <button
-                      onClick={() => {
                         setView('ranking');
                         setIsMenuOpen(false);
                       }}
@@ -1730,6 +1734,22 @@ export default function App() {
                         Administración
                       </button>
                     )}
+                    <button
+                      onClick={() => {
+                        const now = new Date();
+                        const options = { timeZone: 'America/Mexico_City', year: 'numeric', month: '2-digit', day: '2-digit', hour: '2-digit', minute: '2-digit' } as const;
+                        const formatter = new Intl.DateTimeFormat('es-MX', options);
+                        const dateStr = formatter.format(now);
+                        const message = `Hola, necesito ayuda con el sistema GuiaMX [${dateStr}]`;
+                        const phone = import.meta.env.VITE_SUPPORT_WHATSAPP_NUMBER || '522288455191';
+                        window.open(`https://wa.me/${phone}?text=${encodeURIComponent(message)}`, '_blank');
+                        setIsMenuOpen(false);
+                      }}
+                      className="flex w-full items-center gap-3 rounded-xl px-3 py-2.5 text-sm font-bold transition-colors text-slate-700 hover:bg-slate-50 dark:text-slate-300 dark:hover:bg-slate-800"
+                    >
+                      <HelpCircle className="h-4 w-4" />
+                      Ayuda
+                    </button>
                     <div className="my-1 border-t border-slate-100 dark:border-slate-800" />
                     <button
                       onClick={() => {
@@ -1776,7 +1796,7 @@ export default function App() {
                         <X className="h-5 w-5" />
                       </button>
                     )}
-                    <button className="flex h-9 w-9 items-center justify-center rounded-full bg-walmart-yellow text-walmart-blue shadow-sm hover:bg-yellow-400 transition-colors">
+                    <button className="flex h-9 w-9 items-center justify-center rounded-full bg-slate-100 text-walmart-blue shadow-sm hover:bg-slate-200 dark:bg-white dark:text-walmart-blue dark:hover:bg-slate-100 transition-colors">
                       <Search className="h-4 w-4" />
                     </button>
                   </div>
@@ -2218,11 +2238,37 @@ export default function App() {
                       </div>
                     </div>
                   </div>
+
+                  <div className="p-4 rounded-2xl bg-slate-50 dark:bg-slate-800/50 border border-slate-100 dark:border-slate-800">
+                    <h3 className="text-sm font-bold text-slate-900 dark:text-white mb-2 flex items-center gap-2">
+                      <RefreshCw className="h-4 w-4 text-walmart-blue" />
+                      Sincronización de Datos
+                    </h3>
+                    <div className="space-y-3">
+                      <p className="text-xs text-slate-600 dark:text-slate-400">
+                        Fuerza la sincronización de los datos con el servidor para obtener la información más reciente.
+                      </p>
+                      <button
+                        onClick={() => fetchClients(true)}
+                        className="flex w-full items-center justify-center gap-2 rounded-xl bg-walmart-blue py-3 text-sm font-bold text-white shadow-md hover:bg-blue-700 active:scale-[0.98] transition-all"
+                      >
+                        <RefreshCw className="h-4 w-4" />
+                        Sincronizar Datos Ahora
+                      </button>
+                    </div>
+                  </div>
                 </div>
               </div>
             </motion.div>
           )}
         </AnimatePresence>
+        
+        {/* Watermark */}
+        <div className="mt-8 pb-4 text-center">
+          <p className="text-[10px] font-medium text-slate-300 dark:text-slate-700 select-none">
+            &copy; 2026 Por Lehabim Cruz
+          </p>
+        </div>
       </main>
 
       {/* Floating Action Button - Walmart Yellow */}
@@ -2246,7 +2292,7 @@ export default function App() {
               setNewClientRating(0);
               setIsAdding(true);
             }}
-            className="fixed bottom-8 right-8 flex h-14 w-14 items-center justify-center rounded-full bg-walmart-yellow text-walmart-blue shadow-2xl z-40"
+            className="fixed bottom-8 right-8 flex h-14 w-14 items-center justify-center rounded-full bg-slate-100 text-walmart-blue shadow-2xl z-40 hover:bg-slate-200 dark:bg-white dark:text-walmart-blue dark:hover:bg-slate-100 transition-colors"
           >
             <Plus className="h-6 w-6" />
           </motion.button>
@@ -2365,7 +2411,7 @@ export default function App() {
                         <p className="text-sm text-slate-600 dark:text-slate-400 leading-relaxed">{selectedClient.references_text}</p>
                       </div>
                     )}
-                    <div className="pt-2">
+                    <div className="pt-2 space-y-3">
                       <motion.a 
                         whileHover={{ scale: 1.02 }}
                         whileTap={{ scale: 0.95 }}
@@ -2379,6 +2425,20 @@ export default function App() {
                         <Navigation size={18} />
                         INICIAR NAVEGACIÓN
                       </motion.a>
+                      
+                      {selectedClient.phone && (
+                        <motion.a
+                          whileHover={{ scale: 1.02 }}
+                          whileTap={{ scale: 0.95 }}
+                          href={getWhatsAppUrl(selectedClient.phone)}
+                          target="_blank"
+                          rel="noopener noreferrer"
+                          className="flex w-full items-center justify-center gap-2 rounded-xl bg-[#25D366] py-3 text-sm font-black text-white shadow-md hover:bg-[#128C7E] transition-colors"
+                        >
+                          <MessageCircle size={18} />
+                          MANDAR WHATSAPP
+                        </motion.a>
+                      )}
                     </div>
                   </div>
                 </div>

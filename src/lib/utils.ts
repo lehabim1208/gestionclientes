@@ -119,3 +119,37 @@ export const getDistance = (lat1: number, lon1: number, lat2: number, lon2: numb
 const deg2rad = (deg: number): number => {
   return deg * (Math.PI / 180);
 };
+
+/**
+ * Gets the appropriate WhatsApp greeting based on the current time in Xalapa, Veracruz.
+ */
+export const getWhatsAppGreeting = (): string => {
+  const options = { timeZone: 'America/Mexico_City', hour: 'numeric', hour12: false } as const;
+  const formatter = new Intl.DateTimeFormat('es-MX', options);
+  const hourStr = formatter.format(new Date());
+  const hour = parseInt(hourStr, 10);
+
+  if (hour < 12) {
+    return "buenos días";
+  } else if (hour < 19) {
+    return "buenas tardes";
+  } else {
+    return "buenas noches";
+  }
+};
+
+/**
+ * Generates a WhatsApp URL with a pre-filled message for a client.
+ */
+export const getWhatsAppUrl = (phone: string): string => {
+  const greeting = getWhatsAppGreeting();
+  const message = `Hola ${greeting}, me comunico de Walmart. Soy el conductor encargado de llevar su pedido. Me dirijo a su domicilio`;
+  let cleanPhone = phone.replace(/\D/g, '');
+  
+  // If it's a 10-digit Mexican number, add the country code
+  if (cleanPhone.length === 10) {
+    cleanPhone = `52${cleanPhone}`;
+  }
+  
+  return `https://wa.me/${cleanPhone}?text=${encodeURIComponent(message)}`;
+};
